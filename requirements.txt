@@ -1,0 +1,5 @@
+# Minimal placeholders; adjust to your environment
+pyyaml
+numpy
+pandas
+opencv-python

@@ -1,0 +1,1 @@
+# Image compare component (placeholder)

@@ -1,0 +1,2 @@
+# DeepStream app config (placeholder)
+# Fill with nvdsapp config keys as needed.

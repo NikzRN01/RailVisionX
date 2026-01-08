@@ -1,0 +1,9 @@
+# Camera configuration (placeholder)
+# Define up to 3 cameras for edge realtime.
+cameras:
+  - name: cam1
+    uri: "rtsp://user:pass@host/stream1"
+  - name: cam2
+    uri: "rtsp://user:pass@host/stream2"
+  - name: cam3
+    uri: "rtsp://user:pass@host/stream3"
