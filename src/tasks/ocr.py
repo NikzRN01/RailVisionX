@@ -1,1 +1,0 @@
-# OCR task wrapper (placeholder)

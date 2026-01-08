@@ -1,0 +1,24 @@
+# WSL/Linux GPU environment (TensorFlow via pip CUDA wheels)
+# Use:
+#   python3 -m venv .venv-wsl
+#   source .venv-wsl/bin/activate
+#   python -m pip install -U pip
+#   pip install -r requirements-wsl.txt
+
+pyyaml
+numpy
+pandas
+
+# Prefer headless OpenCV to avoid libGL GUI dependencies in WSL.
+opencv-python-headless
+pillow
+matplotlib
+pydot
+
+# Use the CUDA-enabled extra to pull compatible NVIDIA runtime libs via pip on Linux.
+tensorflow[and-cuda]
+
+# PyTorch (for the torch-based trainer)
+torch
+torchvision
+pytorch-msssim

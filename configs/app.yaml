@@ -1,4 +1,0 @@
-# Application-level configuration (placeholder)
-app:
-  name: RailVisionX
-  log_level: INFO

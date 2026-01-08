@@ -1,1 +1,0 @@
-"""RailVisionX source package."""

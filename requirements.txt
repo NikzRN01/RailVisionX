@@ -3,3 +3,12 @@ pyyaml
 numpy
 pandas
 opencv-python
+pillow
+tensorflow
+matplotlib
+pydot
+
+# PyTorch (optional, used by apps/train_deblur_torch.py)
+torch
+torchvision
+pytorch-msssim

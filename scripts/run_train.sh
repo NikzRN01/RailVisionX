@@ -1,4 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-echo "run_train.sh stub"
