@@ -42,14 +42,46 @@ def main() -> None:
         default=Path("outputs") / "result",
         help="Also write plots/history here (requested outputs folder).",
     )
+    parser.add_argument(
+        "--preprocess",
+        choices=("none", "lowlight"),
+        default="none",
+        help=(
+            "Optional preprocessing applied to the INPUT (blurred) images before the model. "
+            "Note: this runs on CPU using OpenCV/Pillow and will slow training."
+        ),
+    )
+    parser.add_argument(
+        "--lowlight-method",
+        type=str,
+        default="best",
+        help="Low-light method passed to enhance_lowlight(): best|auto-gamma|clahe|unsharp|auto-gamma+clahe|auto-gamma+clahe+unsharp",
+    )
+    parser.add_argument(
+        "--quality-metrics",
+        action="store_true",
+        help=(
+            "Compute simple no-ground-truth quality metrics between INPUT (blurred) and OUTPUT (restored). "
+            "This adds CPU overhead (uses NumPy). Metrics are saved into history_torch.json/csv."
+        ),
+    )
+    parser.add_argument(
+        "--quality-max-batches",
+        type=int,
+        default=5,
+        help="When --quality-metrics is enabled, only evaluate on the first N batches per epoch (default: 5).",
+    )
     args = parser.parse_args()
 
     import numpy as np
     import torch
     from torch.utils.data import DataLoader
 
-    from src.dataset.dataloader import PairedDeblurDataset
+    from src.preprocessor.dataloader import PairedDeblurDataset
     from src.enhancement.deblur_net_torch import build_deblur_mobilenetv2_torch
+    from src.enhancement.lowlight_enhance import enhance_lowlight
+    from src.quality.blur_score import mean_gradient_magnitude, variance_of_laplacian
+    from src.quality.lowlight_score import mean_intensity
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -90,6 +122,33 @@ def main() -> None:
         print(f"Using gradient accumulation: micro_batch={micro_batch}, effective_batch={effective_batch}, steps={accum_steps}")
 
     h, w = int(args.image_size[0]), int(args.image_size[1])
+
+    def preprocess_batch(x_in: torch.Tensor) -> torch.Tensor:
+        """Apply optional preprocessing to a NCHW float tensor in [0,1]."""
+        mode = str(args.preprocess)
+        if mode == "none":
+            return x_in
+        if mode != "lowlight":
+            raise ValueError("Unsupported preprocess mode. Use: none|lowlight")
+
+        # Do CPU preprocessing (OpenCV/Pillow). Inputs do not need gradients.
+        x_cpu = x_in.detach().to("cpu")
+        x_nhwc = x_cpu.permute(0, 2, 3, 1).contiguous().numpy()
+
+        out_list: list[torch.Tensor] = []
+        for i in range(x_nhwc.shape[0]):
+            img = x_nhwc[i]
+            img = enhance_lowlight(img, method=str(args.lowlight_method))
+
+            img = np.asarray(img, dtype=np.float32)
+            if img.max(initial=0.0) > 1.5:
+                img = img / 255.0
+            img = np.clip(img, 0.0, 1.0)
+            chw = torch.from_numpy(img).permute(2, 0, 1).contiguous().float()
+            out_list.append(chw)
+
+        x_out = torch.stack(out_list, dim=0)
+        return x_out.to(device, non_blocking=True)
 
     train_ds = PairedDeblurDataset(split="train", data_dir=args.data_dir, as_torch=True)
     val_ds = PairedDeblurDataset(split="val", data_dir=args.data_dir, as_torch=True)
@@ -152,10 +211,43 @@ def main() -> None:
         "val_accuracy": [],
     }
 
+    if args.quality_metrics:
+        # Metrics comparing INPUT (blurred) -> OUTPUT (restored)
+        history.update(
+            {
+                "lap_var_in": [],
+                "lap_var_out": [],
+                "lap_var_delta": [],
+                "grad_mean_in": [],
+                "grad_mean_out": [],
+                "grad_mean_delta": [],
+                "intensity_in": [],
+                "intensity_out": [],
+                "intensity_delta": [],
+                "val_lap_var_in": [],
+                "val_lap_var_out": [],
+                "val_lap_var_delta": [],
+                "val_grad_mean_in": [],
+                "val_grad_mean_out": [],
+                "val_grad_mean_delta": [],
+                "val_intensity_in": [],
+                "val_intensity_out": [],
+                "val_intensity_delta": [],
+            }
+        )
+
     def run_epoch(loader: DataLoader, train: bool) -> dict[str, float]:
         model.train(train)
         total_loss = total_mae = total_psnr = total_ssim = total_acc = 0.0
         n = 0
+
+        # Optional quality metrics (INPUT vs OUTPUT) on a subset for speed
+        q_enabled = bool(args.quality_metrics)
+        q_max_batches = max(0, int(args.quality_max_batches))
+        q_lap_in = q_lap_out = q_lap_delta = 0.0
+        q_grad_in = q_grad_out = q_grad_delta = 0.0
+        q_int_in = q_int_out = q_int_delta = 0.0
+        q_count = 0
 
         optim.zero_grad(set_to_none=True)
 
@@ -168,6 +260,13 @@ def main() -> None:
                 x = torch.nn.functional.interpolate(x, size=(h, w), mode="bilinear", align_corners=False)
             if y.shape[-2:] != (h, w):
                 y = torch.nn.functional.interpolate(y, size=(h, w), mode="bilinear", align_corners=False)
+
+            # Keep a copy of the *original* input used for quality metrics.
+            x_for_metrics = x
+
+            if args.preprocess != "none":
+                with torch.no_grad():
+                    x = preprocess_batch(x)
 
             with torch.set_grad_enabled(train):
                 pred = model(x)
@@ -185,6 +284,34 @@ def main() -> None:
                 psnr = psnr_db(y, pred)
                 ssim_val = ssim01(y, pred)
                 acc = pixel_accuracy(y, pred)
+
+                if q_enabled and (q_max_batches <= 0 or step < q_max_batches):
+                    # Compute on at most 2 samples per batch to limit CPU cost.
+                    bsz = int(x_for_metrics.shape[0])
+                    k = min(bsz, 2)
+                    x_np = x_for_metrics[:k].detach().cpu().numpy()
+                    p_np = pred[:k].detach().cpu().numpy()
+                    for j in range(k):
+                        blurred_hwc = np.transpose(x_np[j], (1, 2, 0))
+                        restored_hwc = np.transpose(p_np[j], (1, 2, 0))
+
+                        lap_in = variance_of_laplacian(blurred_hwc)
+                        lap_out = variance_of_laplacian(restored_hwc)
+                        grad_in = mean_gradient_magnitude(blurred_hwc)
+                        grad_out = mean_gradient_magnitude(restored_hwc)
+                        inten_in = mean_intensity(blurred_hwc)
+                        inten_out = mean_intensity(restored_hwc)
+
+                        q_lap_in += lap_in
+                        q_lap_out += lap_out
+                        q_lap_delta += (lap_out - lap_in)
+                        q_grad_in += grad_in
+                        q_grad_out += grad_out
+                        q_grad_delta += (grad_out - grad_in)
+                        q_int_in += inten_in
+                        q_int_out += inten_out
+                        q_int_delta += (inten_out - inten_in)
+                        q_count += 1
 
             bsz = int(x.shape[0])
             total_loss += float(loss.detach().cpu()) * bsz
@@ -206,6 +333,21 @@ def main() -> None:
             "psnr": total_psnr / max(1, n),
             "ssim": total_ssim / max(1, n),
             "accuracy": total_acc / max(1, n),
+            **(
+                {
+                    "lap_var_in": q_lap_in / max(1, q_count),
+                    "lap_var_out": q_lap_out / max(1, q_count),
+                    "lap_var_delta": q_lap_delta / max(1, q_count),
+                    "grad_mean_in": q_grad_in / max(1, q_count),
+                    "grad_mean_out": q_grad_out / max(1, q_count),
+                    "grad_mean_delta": q_grad_delta / max(1, q_count),
+                    "intensity_in": q_int_in / max(1, q_count),
+                    "intensity_out": q_int_out / max(1, q_count),
+                    "intensity_delta": q_int_delta / max(1, q_count),
+                }
+                if q_enabled
+                else {}
+            ),
         }
 
     for epoch in range(1, args.epochs + 1):
@@ -228,6 +370,27 @@ def main() -> None:
         history["val_psnr"].append(val_m["psnr"])
         history["val_ssim"].append(val_m["ssim"])
         history["val_accuracy"].append(val_m["accuracy"])
+
+        if args.quality_metrics:
+            history["lap_var_in"].append(train_m["lap_var_in"])
+            history["lap_var_out"].append(train_m["lap_var_out"])
+            history["lap_var_delta"].append(train_m["lap_var_delta"])
+            history["grad_mean_in"].append(train_m["grad_mean_in"])
+            history["grad_mean_out"].append(train_m["grad_mean_out"])
+            history["grad_mean_delta"].append(train_m["grad_mean_delta"])
+            history["intensity_in"].append(train_m["intensity_in"])
+            history["intensity_out"].append(train_m["intensity_out"])
+            history["intensity_delta"].append(train_m["intensity_delta"])
+
+            history["val_lap_var_in"].append(val_m["lap_var_in"])
+            history["val_lap_var_out"].append(val_m["lap_var_out"])
+            history["val_lap_var_delta"].append(val_m["lap_var_delta"])
+            history["val_grad_mean_in"].append(val_m["grad_mean_in"])
+            history["val_grad_mean_out"].append(val_m["grad_mean_out"])
+            history["val_grad_mean_delta"].append(val_m["grad_mean_delta"])
+            history["val_intensity_in"].append(val_m["intensity_in"])
+            history["val_intensity_out"].append(val_m["intensity_out"])
+            history["val_intensity_delta"].append(val_m["intensity_delta"])
 
         # write history as we go (helps if interrupted)
         (args.plot_dir / "history_torch.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
