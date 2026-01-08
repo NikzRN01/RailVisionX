@@ -14,7 +14,6 @@ from src.dashboard.components.image_compare import (
 
 
 def main():
-    st.set_page_config(page_title="Compare Frames", layout="wide")
     st.title("🔍 Frame Comparison")
     
     st.markdown("""

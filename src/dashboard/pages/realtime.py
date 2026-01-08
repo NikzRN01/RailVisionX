@@ -205,7 +205,6 @@ def calculate_frame_metrics(blurred_frame: np.ndarray, deblurred_frame: np.ndarr
 
 
 def main():
-    st.set_page_config(page_title="Real-time Deblurring", layout="wide")
     st.title("🎬 Real-time Deblurring")
     
     # Initialize session state

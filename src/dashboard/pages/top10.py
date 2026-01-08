@@ -44,7 +44,6 @@ def calculate_frame_score(img: np.ndarray, metric_type: str) -> float:
 
 
 def main():
-    st.set_page_config(page_title="Top-K Frames", layout="wide")
     st.title("🏆 Top-K Frame Rankings")
     
     st.markdown("""
