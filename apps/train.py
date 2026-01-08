@@ -44,7 +44,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--preprocess",
-        choices=("none", "lowlight", "denoise", "both"),
+        choices=("none", "lowlight"),
         default="none",
         help=(
             "Optional preprocessing applied to the INPUT (blurred) images before the model. "
@@ -56,12 +56,6 @@ def main() -> None:
         type=str,
         default="best",
         help="Low-light method passed to enhance_lowlight(): best|auto-gamma|clahe|unsharp|auto-gamma+clahe|auto-gamma+clahe+unsharp",
-    )
-    parser.add_argument(
-        "--denoise-method",
-        type=str,
-        default="best",
-        help="Denoise method passed to denoise(): best|bilateral|nlmeans|median",
     )
     parser.add_argument(
         "--quality-metrics",
@@ -83,9 +77,8 @@ def main() -> None:
     import torch
     from torch.utils.data import DataLoader
 
-    from src.dataset.dataloader import PairedDeblurDataset
+    from src.preprocessor.dataloader import PairedDeblurDataset
     from src.enhancement.deblur_net_torch import build_deblur_mobilenetv2_torch
-    from src.enhancement.denoise import denoise
     from src.enhancement.lowlight_enhance import enhance_lowlight
     from src.quality.blur_score import mean_gradient_magnitude, variance_of_laplacian
     from src.quality.lowlight_score import mean_intensity
@@ -135,6 +128,8 @@ def main() -> None:
         mode = str(args.preprocess)
         if mode == "none":
             return x_in
+        if mode != "lowlight":
+            raise ValueError("Unsupported preprocess mode. Use: none|lowlight")
 
         # Do CPU preprocessing (OpenCV/Pillow). Inputs do not need gradients.
         x_cpu = x_in.detach().to("cpu")
@@ -143,10 +138,7 @@ def main() -> None:
         out_list: list[torch.Tensor] = []
         for i in range(x_nhwc.shape[0]):
             img = x_nhwc[i]
-            if mode in ("lowlight", "both"):
-                img = enhance_lowlight(img, method=str(args.lowlight_method))
-            if mode in ("denoise", "both"):
-                img = denoise(img, method=str(args.denoise_method))
+            img = enhance_lowlight(img, method=str(args.lowlight_method))
 
             img = np.asarray(img, dtype=np.float32)
             if img.max(initial=0.0) > 1.5:

@@ -5,6 +5,9 @@ import json
 import os
 import random
 import sys
+import time
+import threading
+import queue
 from pathlib import Path
 
 
@@ -68,18 +71,19 @@ def _pick_device(device_flag: str):
     return torch.device("cpu")
 
 
-def _preprocess_tensor_nchw01(x_in, *, mode: str, lowlight_method: str, denoise_method: str):
+def _preprocess_tensor_nchw01(x_in, *, mode: str, lowlight_method: str):
     """Apply optional preprocessing to NCHW float tensor in [0,1].
 
     Uses CPU OpenCV/Pillow ops via src/enhancement utilities, so it is slower.
     """
     if mode == "none":
         return x_in
+    if mode != "lowlight":
+        raise ValueError("Unsupported preprocess mode. Use: none|lowlight")
 
     import numpy as np
     import torch
 
-    from src.enhancement.denoise import denoise
     from src.enhancement.lowlight_enhance import enhance_lowlight
 
     device = x_in.device
@@ -89,10 +93,7 @@ def _preprocess_tensor_nchw01(x_in, *, mode: str, lowlight_method: str, denoise_
     out_list: list[torch.Tensor] = []
     for i in range(x_nhwc.shape[0]):
         img = x_nhwc[i]
-        if mode in ("lowlight", "both"):
-            img = enhance_lowlight(img, method=lowlight_method)
-        if mode in ("denoise", "both"):
-            img = denoise(img, method=denoise_method)
+        img = enhance_lowlight(img, method=lowlight_method)
 
         img = np.asarray(img, dtype=np.float32)
         if img.max(initial=0.0) > 1.5:
@@ -162,6 +163,395 @@ def _plot_history(history: dict[str, list[float]], out_path: Path, epochs: int) 
     plt.close()
 
 
+def calibrate_blur(args: argparse.Namespace) -> None:
+    import numpy as np
+
+    from src.realtime.blur_gate import compute_blur_score
+    from src.realtime_preprocessor.realtime_dataloader import _discover_images, _read_image_rgb
+
+    sharp_dir = Path(args.sharp_dir)
+    blurred_dir = Path(args.blurred_dir)
+    metric = str(args.metric)
+    sharp_q = float(args.sharp_quantile)
+    blur_q = float(args.blur_quantile)
+
+    if not (0.0 < sharp_q < 1.0):
+        raise SystemExit("--sharp-quantile must be in (0,1)")
+    if not (0.0 < blur_q < 1.0):
+        raise SystemExit("--blur-quantile must be in (0,1)")
+
+    sharp_samples = _discover_images(sharp_dir)
+    blur_samples = _discover_images(blurred_dir)
+    if not sharp_samples:
+        raise SystemExit(f"No images found in sharp-dir: {sharp_dir}")
+    if not blur_samples:
+        raise SystemExit(f"No images found in blurred-dir: {blurred_dir}")
+
+    def scores_for(samples) -> list[float]:
+        out: list[float] = []
+        for s in samples:
+            if s.path is None:
+                continue
+            img = _read_image_rgb(s.path)
+            bs = compute_blur_score(img, metric=metric)
+            out.append(float(bs.score))
+        return out
+
+    sharp_scores = scores_for(sharp_samples)
+    blur_scores = scores_for(blur_samples)
+
+    if len(sharp_scores) < 5 or len(blur_scores) < 5:
+        print("Warning: very few samples; thresholds may be unstable")
+
+    sharp_scores_np = np.asarray(sharp_scores, dtype=np.float32)
+    blur_scores_np = np.asarray(blur_scores, dtype=np.float32)
+
+    # Recommended thresholds:
+    # - sharp_threshold: conservative lower bound of sharp scores
+    # - blur_threshold: conservative upper bound of blurred scores
+    sharp_threshold = float(np.quantile(sharp_scores_np, sharp_q))
+    blur_threshold = float(np.quantile(blur_scores_np, blur_q))
+
+    out = {
+        "metric": metric,
+        "recommended": {
+            "sharp_threshold": sharp_threshold,
+            "blur_threshold": blur_threshold,
+        },
+        "sharp": {
+            "n": int(sharp_scores_np.size),
+            "min": float(np.min(sharp_scores_np)),
+            "p10": float(np.quantile(sharp_scores_np, 0.10)),
+            "p50": float(np.quantile(sharp_scores_np, 0.50)),
+            "p90": float(np.quantile(sharp_scores_np, 0.90)),
+            "max": float(np.max(sharp_scores_np)),
+        },
+        "blurred": {
+            "n": int(blur_scores_np.size),
+            "min": float(np.min(blur_scores_np)),
+            "p10": float(np.quantile(blur_scores_np, 0.10)),
+            "p50": float(np.quantile(blur_scores_np, 0.50)),
+            "p90": float(np.quantile(blur_scores_np, 0.90)),
+            "max": float(np.max(blur_scores_np)),
+        },
+        "notes": [
+            "Scores are sharpness proxies: higher => sharper.",
+            "Enable routing with: --blur-gate --sharp-threshold <value>",
+        ],
+    }
+
+    out_path = Path(args.out_json)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(out, indent=2), encoding="utf-8")
+    print(json.dumps(out, indent=2))
+    print(f"Wrote: {out_path}")
+
+
+def infer_multistream(args: argparse.Namespace) -> None:
+    """Inference on multiple camera/video sources with per-source queues.
+
+    This is a pragmatic prototype for 3 fixed cameras:
+      - one capture thread per source (OpenCV VideoCapture)
+      - one inference loop consuming frames round-robin
+      - telemetry includes queue depths, FPS, and avg latency
+    """
+
+    import numpy as np
+    import torch
+    import csv
+
+    from src.enhancement.deblur_net_torch import build_deblur_mobilenetv2_torch
+    from src.realtime.blur_gate import BlurGateConfig, compute_blur_score, severity, should_skip_deblur
+    from src.realtime.telemetry import FpsWindow, TimingStats, torch_cuda_memory, try_get_gpu_utilization
+    from src.damage.detector import build_damage_detector, Detection
+    from src.analytics.detection_metrics import load_damage_annotations, evaluate_detections
+
+    try:
+        import cv2  # type: ignore
+    except ImportError as e:
+        raise RuntimeError("infer-multistream requires OpenCV (opencv-python)") from e
+
+    sources = list(args.sources)
+    if not sources:
+        raise SystemExit("Provide at least one --sources value")
+
+    out_dir = Path(args.out_dir)
+    frames_dir = out_dir / "frames"
+    result_dir = out_dir / "result"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    result_dir.mkdir(parents=True, exist_ok=True)
+
+    device = _pick_device(args.device)
+    h, w = int(args.image_size[0]), int(args.image_size[1])
+    preprocess_mode = str(args.preprocess)
+    lowlight_method = str(args.lowlight_method)
+
+    gate = BlurGateConfig(
+        metric=str(args.blur_metric),
+        sharp_threshold=float(args.sharp_threshold),
+        blur_threshold=float(args.blur_threshold),
+    )
+    enable_gate = bool(args.blur_gate)
+    report_every = max(1, int(args.report_every))
+    fps_window_s = float(args.fps_window_s)
+    max_frames = int(args.max_frames)
+    max_frames = 0 if max_frames < 0 else max_frames
+
+    batch_size = max(1, int(args.batch_size))
+    max_wait_ms = max(0.0, float(args.max_wait_ms))
+    use_cuda = device.type == "cuda"
+    use_fp16 = bool(args.fp16) and use_cuda
+    use_pin = bool(args.pin_memory) and use_cuda
+
+    model = build_deblur_mobilenetv2_torch(weights=None, backbone_trainable=False)
+    ckpt = Path(args.checkpoint)
+    state = torch.load(ckpt, map_location=device)
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    model.load_state_dict(state)
+    model.to(device)
+    model.eval()
+
+    # One queue per camera
+    qmax = int(args.queue_size)
+    queues: list[queue.Queue] = [queue.Queue(maxsize=qmax) for _ in sources]
+    stop = threading.Event()
+
+    # Stats per camera
+    cam_stats: list[TimingStats] = [TimingStats() for _ in sources]
+    cam_fps: list[FpsWindow] = [FpsWindow(window_s=fps_window_s) for _ in sources]
+    cam_in_fps: list[FpsWindow] = [FpsWindow(window_s=fps_window_s) for _ in sources]
+
+    def parse_source(s: str) -> int | str:
+        return int(s) if s.isdigit() else s
+
+    def capture_loop(cam_idx: int, src: str) -> None:
+        cap = cv2.VideoCapture(parse_source(src))
+        if not cap.isOpened():
+            print(f"Failed to open source[{cam_idx}]: {src}")
+            stop.set()
+            return
+        frame_count = 0
+        try:
+            while not stop.is_set():
+                ok, frame_bgr = cap.read()
+                if not ok:
+                    break
+                frame_count += 1
+                cam_in_fps[cam_idx].tick()
+
+                # Convert to RGB float32 [0,1]
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                frame01 = frame_rgb.astype(np.float32) / 255.0
+
+                # Resize to model size
+                if frame01.shape[0] != h or frame01.shape[1] != w:
+                    frame01 = cv2.resize(frame01, (w, h), interpolation=cv2.INTER_LINEAR)
+
+                item = {
+                    "cam": cam_idx,
+                    "key": f"cam{cam_idx}_frame_{frame_count:06d}",
+                    "t_capture": time.perf_counter(),
+                    "frame_hwc": frame01,
+                }
+                try:
+                    queues[cam_idx].put(item, timeout=0.2)
+                except queue.Full:
+                    # Drop frames under load; this is intentional for realtime.
+                    continue
+        finally:
+            cap.release()
+
+    threads: list[threading.Thread] = []
+    for i, s in enumerate(sources):
+        t = threading.Thread(target=capture_loop, args=(i, s), daemon=True)
+        t.start()
+        threads.append(t)
+
+    from src.analytics.metrics import restoration_metrics
+
+    metrics_rows: list[dict[str, object]] = []
+    processed_total = 0
+    rr = 0
+
+    detector = build_damage_detector(str(getattr(args, "damage_detector", "none")))
+    ann_path = getattr(args, "damage_annotations", None)
+    gts = load_damage_annotations(Path(ann_path)) if ann_path else None
+    dmg_iou = float(getattr(args, "damage_iou_thr", 0.5))
+    dmg_score = float(getattr(args, "damage_score_thr", 0.25))
+    preds_orig: dict[str, list[Detection]] = {}
+    preds_rest: dict[str, list[Detection]] = {}
+
+    def _infer_batch(frames_hwc: list[np.ndarray]) -> np.ndarray:
+        x_cpu = torch.from_numpy(np.stack([f.transpose(2, 0, 1) for f in frames_hwc], axis=0)).float().contiguous()
+        if preprocess_mode != "none":
+            x_cpu = _preprocess_tensor_nchw01(
+                x_cpu,
+                mode=preprocess_mode,
+                lowlight_method=lowlight_method,
+            )
+        if use_pin:
+            x_cpu = x_cpu.pin_memory()
+        x = x_cpu.to(device, non_blocking=True) if use_cuda else x_cpu
+        with torch.inference_mode():
+            if use_fp16:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    y = model(x)
+            else:
+                y = model(x)
+        return y.detach().float().cpu().numpy()
+
+    try:
+        batch: list[dict[str, object]] = []
+        batch_started = time.perf_counter()
+
+        while not stop.is_set():
+            if max_frames and processed_total >= max_frames:
+                break
+
+            cam_idx = rr % len(sources)
+            rr += 1
+
+            try:
+                item = queues[cam_idx].get(timeout=0.05)
+                batch.append(item)
+            except queue.Empty:
+                pass
+
+            now = time.perf_counter()
+            ready = len(batch) >= batch_size
+            if not ready and max_wait_ms > 0.0:
+                ready = (now - batch_started) * 1000.0 >= max_wait_ms
+            if not ready:
+                if not batch and all(q.empty() for q in queues):
+                    time.sleep(0.005)
+                continue
+
+            t0 = time.perf_counter()
+            frames_hwc: list[np.ndarray] = [it["frame_hwc"] for it in batch]  # type: ignore[index]
+            cams: list[int] = [int(it["cam"]) for it in batch]  # type: ignore[index]
+            keys: list[str] = [str(it["key"]) for it in batch]  # type: ignore[index]
+            t_caps: list[float] = [float(it["t_capture"]) for it in batch]  # type: ignore[index]
+
+            blur_meta: list[dict[str, object]] = []
+            run_mask: list[bool] = []
+            for frame in frames_hwc:
+                bs = compute_blur_score(frame, metric=gate.metric)
+                sev = severity(bs.score, cfg=gate)
+                skip = bool(enable_gate and should_skip_deblur(bs.score, sharp_threshold=gate.sharp_threshold))
+                run_mask.append(not skip)
+                blur_meta.append(
+                    {
+                        "severity": sev,
+                        "blur_score": float(bs.score),
+                        "blur_lap_var": float(bs.lap_var),
+                        "blur_grad_mean": float(bs.grad_mean),
+                        "skipped_deblur": bool(skip),
+                    }
+                )
+
+            preds_hwc: list[np.ndarray] = [f for f in frames_hwc]
+            to_run = [idx for idx, run in enumerate(run_mask) if run]
+            t_inf = 0.0
+
+            if to_run:
+                run_frames = [frames_hwc[idx] for idx in to_run]
+                t_inf0 = time.perf_counter()
+                y = _infer_batch(run_frames)  # NCHW
+                t_inf = time.perf_counter() - t_inf0
+                for j, idx in enumerate(to_run):
+                    preds_hwc[idx] = np.clip(y[j].transpose(1, 2, 0), 0.0, 1.0)
+
+            for cam_i, key, frame, pred, meta, tcap in zip(cams, keys, frames_hwc, preds_hwc, blur_meta, t_caps):
+                if bool(meta["skipped_deblur"]):
+                    cam_stats[cam_i].skipped += 1
+
+                m = restoration_metrics(frame, pred)
+                cam_dir = frames_dir / f"cam{cam_i}"
+                (cam_dir / "original").mkdir(parents=True, exist_ok=True)
+                (cam_dir / "restored").mkdir(parents=True, exist_ok=True)
+                _save_rgb01_png(frame, cam_dir / "original" / f"{key}.png")
+                _save_rgb01_png(pred, cam_dir / "restored" / f"{key}.png")
+
+                if detector is not None:
+                    try:
+                        preds_orig.setdefault(key, []).extend(detector.detect(frame))
+                        preds_rest.setdefault(key, []).extend(detector.detect(pred))
+                    except Exception:
+                        pass
+
+                end_to_end = time.perf_counter() - float(tcap)
+                metrics_rows.append(
+                    {
+                        "key": key,
+                        "cam": int(cam_i),
+                        "latency_end_to_end_ms": float(end_to_end * 1000.0),
+                        **meta,
+                        **m.as_dict(),
+                    }
+                )
+
+                st = cam_stats[cam_i]
+                st.frames += 1
+                st.t_total_s += (time.perf_counter() - t0)
+                st.t_infer_s += float(t_inf) / max(1, len(to_run)) if to_run else 0.0
+                cam_fps[cam_i].tick()
+                processed_total += 1
+
+            if processed_total % report_every == 0:
+                msg: dict[str, object] = {
+                    "processed": int(processed_total),
+                    "queues": [int(q.qsize()) for q in queues],
+                    "in_fps": [f.fps() for f in cam_in_fps],
+                    "proc_fps": [f.fps() for f in cam_fps],
+                    "avg_total_ms": [1000.0 * (s.t_total_s / max(1, s.frames)) for s in cam_stats],
+                    "skipped": [int(s.skipped) for s in cam_stats],
+                    "batch_size": int(batch_size),
+                }
+                gpu = try_get_gpu_utilization()
+                if gpu is not None:
+                    msg.update(gpu)
+                tc = torch_cuda_memory()
+                if tc is not None:
+                    msg.update(tc)
+                print(json.dumps(msg))
+
+            batch.clear()
+            batch_started = time.perf_counter()
+
+    finally:
+        stop.set()
+        for t in threads:
+            t.join(timeout=1.0)
+
+    if metrics_rows:
+        out_csv = result_dir / "restoration_metrics_multistream.csv"
+        with out_csv.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(metrics_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(metrics_rows)
+
+    if detector is not None and gts is not None:
+        s0 = evaluate_detections(preds_orig, gts, iou_thr=dmg_iou, score_thr=dmg_score)
+        s1 = evaluate_detections(preds_rest, gts, iou_thr=dmg_iou, score_thr=dmg_score)
+        summary = {
+            "iou_thr": float(dmg_iou),
+            "score_thr": float(dmg_score),
+            "original": s0.as_dict(),
+            "restored": s1.as_dict(),
+            "delta": {
+                "ap": float(s1.ap - s0.ap),
+                "recall": float(s1.recall - s0.recall),
+                "precision": float(s1.precision - s0.precision),
+            },
+        }
+        out_json = result_dir / "damage_metrics_multistream.json"
+        out_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        print(json.dumps({"damage": summary}))
+
+    print(f"Saved multistream outputs to: {out_dir}")
+
+
 def train(args: argparse.Namespace) -> None:
     import numpy as np
     import torch
@@ -197,7 +587,6 @@ def train(args: argparse.Namespace) -> None:
     h, w = int(args.image_size[0]), int(args.image_size[1])
     preprocess_mode = str(args.preprocess)
     lowlight_method = str(args.lowlight_method)
-    denoise_method = str(args.denoise_method)
 
     train_ds = RealtimePairedFramesDataset(
         split="train",
@@ -329,7 +718,6 @@ def train(args: argparse.Namespace) -> None:
                         x,
                         mode=preprocess_mode,
                         lowlight_method=lowlight_method,
-                        denoise_method=denoise_method,
                     )
 
             with torch.set_grad_enabled(train_mode):
@@ -483,7 +871,6 @@ def infer_random(args: argparse.Namespace) -> None:
     h, w = int(args.image_size[0]), int(args.image_size[1])
     preprocess_mode = str(args.preprocess)
     lowlight_method = str(args.lowlight_method)
-    denoise_method = str(args.denoise_method)
 
     model = build_deblur_mobilenetv2_torch(weights=None, backbone_trainable=False)
     ckpt = Path(args.checkpoint)
@@ -514,7 +901,6 @@ def infer_random(args: argparse.Namespace) -> None:
                 x,
                 mode=preprocess_mode,
                 lowlight_method=lowlight_method,
-                denoise_method=denoise_method,
             )
         x = x.to(device)
         with torch.no_grad():
@@ -558,9 +944,14 @@ def infer_random(args: argparse.Namespace) -> None:
 def infer_stream(args: argparse.Namespace) -> None:
     import torch
     import csv
+    import numpy as np
 
     from src.enhancement.deblur_net_torch import build_deblur_mobilenetv2_torch
     from src.realtime_preprocessor.realtime_dataloader import RealtimeStream
+    from src.realtime.blur_gate import BlurGateConfig, compute_blur_score, severity, should_skip_deblur
+    from src.realtime.telemetry import FpsWindow, TimingStats, torch_cuda_memory, try_get_gpu_utilization
+    from src.damage.detector import build_damage_detector, Detection
+    from src.analytics.detection_metrics import load_damage_annotations, evaluate_detections
 
     out_dir = Path(args.out_dir)
     original_dir, restored_dir, _, result_dir = _ensure_out_dirs(out_dir)
@@ -569,7 +960,16 @@ def infer_stream(args: argparse.Namespace) -> None:
     h, w = int(args.image_size[0]), int(args.image_size[1])
     preprocess_mode = str(args.preprocess)
     lowlight_method = str(args.lowlight_method)
-    denoise_method = str(args.denoise_method)
+
+    gate = BlurGateConfig(
+        metric=str(args.blur_metric),
+        sharp_threshold=float(args.sharp_threshold),
+        blur_threshold=float(args.blur_threshold),
+    )
+    enable_gate = bool(args.blur_gate)
+    report_every = max(1, int(args.report_every))
+    fpsw = FpsWindow(window_s=float(args.fps_window_s))
+    stats = TimingStats()
 
     model = build_deblur_mobilenetv2_torch(weights=None, backbone_trainable=False)
     ckpt = Path(args.checkpoint)
@@ -579,6 +979,12 @@ def infer_stream(args: argparse.Namespace) -> None:
     model.load_state_dict(state)
     model.to(device)
     model.eval()
+
+    use_cuda = device.type == "cuda"
+    use_fp16 = bool(args.fp16) and use_cuda
+    use_pin = bool(args.pin_memory) and use_cuda
+    batch_size = max(1, int(args.batch_size))
+    max_wait_ms = max(0.0, float(args.max_wait_ms))
 
     src: str = args.source
     source: int | str = int(src) if src.isdigit() else src
@@ -595,30 +1001,167 @@ def infer_stream(args: argparse.Namespace) -> None:
 
     metrics_rows: list[dict[str, object]] = []
 
-    for i, item in enumerate(stream, start=1):
-        key = item["key"]
-        x = item["frame"].unsqueeze(0)
+    detector = build_damage_detector(str(getattr(args, "damage_detector", "none")))
+    ann_path = getattr(args, "damage_annotations", None)
+    gts = load_damage_annotations(Path(ann_path)) if ann_path else None
+    dmg_iou = float(getattr(args, "damage_iou_thr", 0.5))
+    dmg_score = float(getattr(args, "damage_score_thr", 0.25))
+    preds_orig: dict[str, list[Detection]] = {}
+    preds_rest: dict[str, list[Detection]] = {}
+
+    def _run_model(x_cpu: torch.Tensor) -> torch.Tensor:
+        """Run model on CPU batch NCHW in [0,1]. Returns CPU NCHW."""
         if preprocess_mode != "none":
-            x = _preprocess_tensor_nchw01(
-                x,
+            x_cpu = _preprocess_tensor_nchw01(
+                x_cpu,
                 mode=preprocess_mode,
                 lowlight_method=lowlight_method,
-                denoise_method=denoise_method,
             )
-        x = x.to(device)
-        with torch.no_grad():
-            pred = model(x).squeeze(0).detach().cpu()
 
-        blurred_hwc = item["frame"].detach().cpu().numpy().transpose(1, 2, 0)
-        restored_hwc = pred.detach().cpu().numpy().transpose(1, 2, 0)
-        m = restoration_metrics(blurred_hwc, restored_hwc)
-        metrics_rows.append({"key": key, **m.as_dict()})
+        if use_pin:
+            x_cpu = x_cpu.pin_memory()
 
-        _save_rgb01_png(item["frame"], original_dir / f"{key}.png")
-        _save_rgb01_png(pred, restored_dir / f"{key}.png")
+        x = x_cpu.to(device, non_blocking=True) if use_cuda else x_cpu
+        with torch.inference_mode():
+            if use_fp16:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    y = model(x)
+            else:
+                y = model(x)
+        return y.detach().float().cpu()
 
-        if i % 10 == 0:
-            print(f"Saved {i} frames")
+    batch: list[dict[str, object]] = []
+    batch_started = time.perf_counter()
+    frame_idx = 0
+
+    for item in stream:
+        frame_idx += 1
+        batch.append(item)
+
+        now = time.perf_counter()
+        ready = len(batch) >= batch_size
+        if not ready and max_wait_ms > 0.0:
+            ready = (now - batch_started) * 1000.0 >= max_wait_ms
+        if not ready:
+            continue
+
+        t0 = time.perf_counter()
+        keys: list[str] = []
+        frames_chw: list[torch.Tensor] = []
+        blurred_hwcs: list[np.ndarray] = []
+        meta: list[dict[str, object]] = []
+        run_mask: list[bool] = []
+
+        for it in batch:
+            key = str(it["key"])
+            frame_chw = it["frame"]
+            if not hasattr(frame_chw, "detach"):
+                raise RuntimeError("Expected torch frames from RealtimeStream(as_torch=True)")
+
+            frame_chw_t = frame_chw.detach().cpu().contiguous()
+            blurred_hwc = frame_chw_t.numpy().transpose(1, 2, 0)
+
+            bs = compute_blur_score(blurred_hwc, metric=gate.metric)
+            sev = severity(bs.score, cfg=gate)
+            skip = bool(enable_gate and should_skip_deblur(bs.score, sharp_threshold=gate.sharp_threshold))
+
+            keys.append(key)
+            frames_chw.append(frame_chw_t)
+            blurred_hwcs.append(blurred_hwc)
+            meta.append(
+                {
+                    "severity": sev,
+                    "blur_score": float(bs.score),
+                    "blur_lap_var": float(bs.lap_var),
+                    "blur_grad_mean": float(bs.grad_mean),
+                    "skipped_deblur": bool(skip),
+                }
+            )
+            run_mask.append(not skip)
+            if skip:
+                stats.skipped += 1
+
+        # Inference for subset; others pass through.
+        preds: list[torch.Tensor] = [f for f in frames_chw]
+        to_run = [idx for idx, run in enumerate(run_mask) if run]
+
+        t_pre = 0.0
+        t_inf = 0.0
+        if to_run:
+            x_cpu = torch.stack([frames_chw[idx] for idx in to_run], dim=0).contiguous()
+            t_pre0 = time.perf_counter()
+            if preprocess_mode != "none":
+                x_cpu = _preprocess_tensor_nchw01(
+                    x_cpu,
+                    mode=preprocess_mode,
+                    lowlight_method=lowlight_method,
+                )
+            t_pre = time.perf_counter() - t_pre0
+
+            if use_pin:
+                x_cpu = x_cpu.pin_memory()
+
+            x = x_cpu.to(device, non_blocking=True) if use_cuda else x_cpu
+            t_inf0 = time.perf_counter()
+            with torch.inference_mode():
+                if use_fp16:
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        y = model(x)
+                else:
+                    y = model(x)
+            y_cpu = y.detach().float().cpu()
+            t_inf = time.perf_counter() - t_inf0
+
+            for j, idx in enumerate(to_run):
+                preds[idx] = y_cpu[j]
+
+        t_save0 = time.perf_counter()
+        for key, frame_chw_t, pred_chw, blurred_hwc, m0 in zip(keys, frames_chw, preds, blurred_hwcs, meta):
+            restored_hwc = pred_chw.detach().cpu().numpy().transpose(1, 2, 0)
+            m = restoration_metrics(blurred_hwc, restored_hwc)
+            metrics_rows.append({"key": key, **m0, **m.as_dict()})
+            _save_rgb01_png(frame_chw_t, original_dir / f"{key}.png")
+            _save_rgb01_png(pred_chw, restored_dir / f"{key}.png")
+
+            if detector is not None:
+                try:
+                    preds_orig.setdefault(key, []).extend(detector.detect(blurred_hwc))
+                    preds_rest.setdefault(key, []).extend(detector.detect(restored_hwc))
+                except Exception:
+                    pass
+        t_save = time.perf_counter() - t_save0
+
+        t_total = time.perf_counter() - t0
+        stats.frames += len(batch)
+        stats.t_total_s += float(t_total)
+        stats.t_preprocess_s += float(t_pre)
+        stats.t_infer_s += float(t_inf)
+        stats.t_save_s += float(t_save)
+        for _ in batch:
+            fpsw.tick()
+
+        if frame_idx % report_every == 0:
+            avg_total_ms = 1000.0 * (stats.t_total_s / max(1, stats.frames))
+            ran = max(1, stats.frames - stats.skipped)
+            avg_inf_ms = 1000.0 * (stats.t_infer_s / ran)
+            msg = {
+                "frames": int(stats.frames),
+                "fps_window": fpsw.fps(),
+                "avg_total_ms": avg_total_ms,
+                "avg_infer_ms": avg_inf_ms,
+                "skipped": int(stats.skipped),
+                "batch_size": int(batch_size),
+            }
+            gpu = try_get_gpu_utilization()
+            if gpu is not None:
+                msg.update(gpu)
+            tc = torch_cuda_memory()
+            if tc is not None:
+                msg.update(tc)
+            print(json.dumps(msg))
+
+        batch.clear()
+        batch_started = time.perf_counter()
 
     if metrics_rows:
         out_csv = result_dir / "restoration_metrics_stream.csv"
@@ -627,15 +1170,38 @@ def infer_stream(args: argparse.Namespace) -> None:
             writer.writeheader()
             writer.writerows(metrics_rows)
 
+    if detector is not None and gts is not None:
+        s0 = evaluate_detections(preds_orig, gts, iou_thr=dmg_iou, score_thr=dmg_score)
+        s1 = evaluate_detections(preds_rest, gts, iou_thr=dmg_iou, score_thr=dmg_score)
+        summary = {
+            "iou_thr": float(dmg_iou),
+            "score_thr": float(dmg_score),
+            "original": s0.as_dict(),
+            "restored": s1.as_dict(),
+            "delta": {
+                "ap": float(s1.ap - s0.ap),
+                "recall": float(s1.recall - s0.recall),
+                "precision": float(s1.precision - s0.precision),
+            },
+        }
+        out_json = result_dir / "damage_metrics_stream.json"
+        out_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        print(json.dumps({"damage": summary}))
+
     print(f"Saved stream inference outputs to: {out_dir}")
 
 
 def infer_frames(args: argparse.Namespace) -> None:
     import torch
     import csv
+    import numpy as np
 
     from src.enhancement.deblur_net_torch import build_deblur_mobilenetv2_torch
     from src.realtime_preprocessor.realtime_dataloader import RealtimeFolderFramesDataset, build_torch_dataloader
+    from src.realtime.blur_gate import BlurGateConfig, compute_blur_score, severity, should_skip_deblur
+    from src.realtime.telemetry import FpsWindow, TimingStats, torch_cuda_memory, try_get_gpu_utilization
+    from src.damage.detector import build_damage_detector, Detection
+    from src.analytics.detection_metrics import load_damage_annotations, evaluate_detections
 
     out_dir = Path(args.out_dir)
     original_dir, restored_dir, _, result_dir = _ensure_out_dirs(out_dir)
@@ -644,7 +1210,16 @@ def infer_frames(args: argparse.Namespace) -> None:
     h, w = int(args.image_size[0]), int(args.image_size[1])
     preprocess_mode = str(args.preprocess)
     lowlight_method = str(args.lowlight_method)
-    denoise_method = str(args.denoise_method)
+
+    gate = BlurGateConfig(
+        metric=str(args.blur_metric),
+        sharp_threshold=float(args.sharp_threshold),
+        blur_threshold=float(args.blur_threshold),
+    )
+    enable_gate = bool(args.blur_gate)
+    report_every = max(1, int(args.report_every))
+    fpsw = FpsWindow(window_s=float(args.fps_window_s))
+    stats = TimingStats()
 
     model = build_deblur_mobilenetv2_torch(weights=None, backbone_trainable=False)
     ckpt = Path(args.checkpoint)
@@ -662,27 +1237,97 @@ def infer_frames(args: argparse.Namespace) -> None:
 
     metrics_rows: list[dict[str, object]] = []
 
-    for i, batch in enumerate(loader, start=1):
-        key = batch["key"][0]
-        x = batch["frame"]
-        if preprocess_mode != "none":
-            x = _preprocess_tensor_nchw01(
-                x,
-                mode=preprocess_mode,
-                lowlight_method=lowlight_method,
-                denoise_method=denoise_method,
-            )
-        x = x.to(device)
-        with torch.no_grad():
-            pred = model(x).squeeze(0).detach().cpu()
+    detector = build_damage_detector(str(getattr(args, "damage_detector", "none")))
+    ann_path = getattr(args, "damage_annotations", None)
+    gts = load_damage_annotations(Path(ann_path)) if ann_path else None
+    dmg_iou = float(getattr(args, "damage_iou_thr", 0.5))
+    dmg_score = float(getattr(args, "damage_score_thr", 0.25))
+    preds_orig: dict[str, list[Detection]] = {}
+    preds_rest: dict[str, list[Detection]] = {}
 
-        blurred_hwc = batch["frame"].squeeze(0).detach().cpu().numpy().transpose(1, 2, 0)
+    for i, batch in enumerate(loader, start=1):
+        t0 = time.perf_counter()
+        key = batch["key"][0]
+        frame_chw = batch["frame"].squeeze(0)
+        blurred_hwc = frame_chw.detach().cpu().numpy().transpose(1, 2, 0)
+
+        bs = compute_blur_score(blurred_hwc, metric=gate.metric)
+        sev = severity(bs.score, cfg=gate)
+        skip = bool(enable_gate and should_skip_deblur(bs.score, sharp_threshold=gate.sharp_threshold))
+
+        t_pre = 0.0
+        t_inf = 0.0
+        if skip:
+            pred = frame_chw.detach().cpu()
+            stats.skipped += 1
+        else:
+            x = frame_chw.unsqueeze(0)
+            if preprocess_mode != "none":
+                t_pre0 = time.perf_counter()
+                x = _preprocess_tensor_nchw01(
+                    x,
+                    mode=preprocess_mode,
+                    lowlight_method=lowlight_method,
+                )
+                t_pre = time.perf_counter() - t_pre0
+            x = x.to(device)
+
+            t_inf0 = time.perf_counter()
+            with torch.no_grad():
+                pred = model(x).squeeze(0).detach().cpu()
+            t_inf = time.perf_counter() - t_inf0
+
         restored_hwc = pred.detach().cpu().numpy().transpose(1, 2, 0)
         m = restoration_metrics(blurred_hwc, restored_hwc)
-        metrics_rows.append({"key": str(key), **m.as_dict()})
+        metrics_rows.append(
+            {
+                "key": str(key),
+                "severity": sev,
+                "blur_score": float(bs.score),
+                "blur_lap_var": float(bs.lap_var),
+                "blur_grad_mean": float(bs.grad_mean),
+                "skipped_deblur": bool(skip),
+                **m.as_dict(),
+            }
+        )
 
-        _save_rgb01_png(batch["frame"].squeeze(0), original_dir / f"{key}.png")
+        if detector is not None:
+            try:
+                preds_orig.setdefault(str(key), []).extend(detector.detect(blurred_hwc))
+                preds_rest.setdefault(str(key), []).extend(detector.detect(restored_hwc))
+            except Exception:
+                pass
+
+        t_save0 = time.perf_counter()
+        _save_rgb01_png(frame_chw, original_dir / f"{key}.png")
         _save_rgb01_png(pred, restored_dir / f"{key}.png")
+        t_save = time.perf_counter() - t_save0
+
+        t_total = time.perf_counter() - t0
+        stats.frames += 1
+        stats.t_total_s += t_total
+        stats.t_preprocess_s += float(t_pre)
+        stats.t_infer_s += float(t_inf)
+        stats.t_save_s += float(t_save)
+        fpsw.tick()
+
+        if i % report_every == 0:
+            avg_total_ms = 1000.0 * (stats.t_total_s / max(1, stats.frames))
+            avg_inf_ms = 1000.0 * (stats.t_infer_s / max(1, stats.frames - stats.skipped)) if (stats.frames - stats.skipped) > 0 else 0.0
+            msg = {
+                "frames": int(stats.frames),
+                "fps_window": fpsw.fps(),
+                "avg_total_ms": avg_total_ms,
+                "avg_infer_ms": avg_inf_ms,
+                "skipped": int(stats.skipped),
+            }
+            gpu = try_get_gpu_utilization()
+            if gpu is not None:
+                msg.update(gpu)
+            tc = torch_cuda_memory()
+            if tc is not None:
+                msg.update(tc)
+            print(json.dumps(msg))
 
         if int(args.max_images) > 0 and i >= int(args.max_images):
             break
@@ -696,6 +1341,24 @@ def infer_frames(args: argparse.Namespace) -> None:
             writer = csv.DictWriter(f, fieldnames=list(metrics_rows[0].keys()))
             writer.writeheader()
             writer.writerows(metrics_rows)
+
+    if detector is not None and gts is not None:
+        s0 = evaluate_detections(preds_orig, gts, iou_thr=dmg_iou, score_thr=dmg_score)
+        s1 = evaluate_detections(preds_rest, gts, iou_thr=dmg_iou, score_thr=dmg_score)
+        summary = {
+            "iou_thr": float(dmg_iou),
+            "score_thr": float(dmg_score),
+            "original": s0.as_dict(),
+            "restored": s1.as_dict(),
+            "delta": {
+                "ap": float(s1.ap - s0.ap),
+                "recall": float(s1.recall - s0.recall),
+                "precision": float(s1.precision - s0.precision),
+            },
+        }
+        out_json = result_dir / "damage_metrics_frames.json"
+        out_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        print(json.dumps({"damage": summary}))
 
     print(f"Saved folder inference outputs to: {out_dir}")
 
@@ -729,12 +1392,11 @@ def main() -> None:
     p_train.add_argument("--out-dir", type=Path, default=Path("outputs") / "realtime")
     p_train.add_argument(
         "--preprocess",
-        choices=("none", "lowlight", "denoise", "both"),
+        choices=("none", "lowlight"),
         default="none",
         help="Optional preprocessing applied to INPUT frames before the model (runs on CPU; slower).",
     )
     p_train.add_argument("--lowlight-method", type=str, default="best")
-    p_train.add_argument("--denoise-method", type=str, default="best")
     p_train.add_argument(
         "--quality-metrics",
         action="store_true",
@@ -763,9 +1425,22 @@ def main() -> None:
         default=Path("models") / "checkpoints" / "deblur_mobilenetv2_unet_torch_best.pt",
     )
     p_stream.add_argument("--out-dir", type=Path, default=Path("outputs") / "realtime")
-    p_stream.add_argument("--preprocess", choices=("none", "lowlight", "denoise", "both"), default="none")
+    p_stream.add_argument("--preprocess", choices=("none", "lowlight"), default="none")
     p_stream.add_argument("--lowlight-method", type=str, default="best")
-    p_stream.add_argument("--denoise-method", type=str, default="best")
+    p_stream.add_argument("--blur-gate", action="store_true", help="Skip deblur when frame is already sharp")
+    p_stream.add_argument("--blur-metric", choices=("lap_var", "grad_mean", "combo"), default="combo")
+    p_stream.add_argument("--sharp-threshold", type=float, default=0.020, help="Skip deblur if score >= this")
+    p_stream.add_argument("--blur-threshold", type=float, default=0.008, help="Severe blur if score <= this")
+    p_stream.add_argument("--report-every", type=int, default=30, help="Print telemetry JSON every N frames")
+    p_stream.add_argument("--fps-window-s", type=float, default=2.0, help="Sliding window size for FPS")
+    p_stream.add_argument("--batch-size", type=int, default=4, help="Micro-batch size for inference")
+    p_stream.add_argument("--max-wait-ms", type=float, default=30.0, help="Max wait to fill a batch (0 disables)")
+    p_stream.add_argument("--pin-memory", action="store_true", help="Use pinned CPU memory + non-blocking H2D")
+    p_stream.add_argument("--fp16", action="store_true", help="Use CUDA autocast fp16 for faster inference")
+    p_stream.add_argument("--damage-detector", type=str, default="none", help="Damage detector: none|placeholder")
+    p_stream.add_argument("--damage-annotations", type=Path, default=None, help="Path to GT annotation JSON")
+    p_stream.add_argument("--damage-iou-thr", type=float, default=0.5, help="IoU threshold (e.g. 0.5)")
+    p_stream.add_argument("--damage-score-thr", type=float, default=0.25, help="Score threshold for recall/precision")
     p_stream.set_defaults(func=infer_stream)
 
     p_frames = sub.add_parser("infer-frames", help="Inference on frames folder")
@@ -784,10 +1459,79 @@ def main() -> None:
         default=Path("models") / "checkpoints" / "deblur_mobilenetv2_unet_torch_best.pt",
     )
     p_frames.add_argument("--out-dir", type=Path, default=Path("outputs") / "realtime")
-    p_frames.add_argument("--preprocess", choices=("none", "lowlight", "denoise", "both"), default="none")
+    p_frames.add_argument("--preprocess", choices=("none", "lowlight"), default="none")
     p_frames.add_argument("--lowlight-method", type=str, default="best")
-    p_frames.add_argument("--denoise-method", type=str, default="best")
+    p_frames.add_argument("--blur-gate", action="store_true", help="Skip deblur when frame is already sharp")
+    p_frames.add_argument("--blur-metric", choices=("lap_var", "grad_mean", "combo"), default="combo")
+    p_frames.add_argument("--sharp-threshold", type=float, default=0.020, help="Skip deblur if score >= this")
+    p_frames.add_argument("--blur-threshold", type=float, default=0.008, help="Severe blur if score <= this")
+    p_frames.add_argument("--report-every", type=int, default=30, help="Print telemetry JSON every N frames")
+    p_frames.add_argument("--fps-window-s", type=float, default=2.0, help="Sliding window size for FPS")
+    p_frames.add_argument("--damage-detector", type=str, default="none", help="Damage detector: none|placeholder")
+    p_frames.add_argument("--damage-annotations", type=Path, default=None, help="Path to GT annotation JSON")
+    p_frames.add_argument("--damage-iou-thr", type=float, default=0.5, help="IoU threshold (e.g. 0.5)")
+    p_frames.add_argument("--damage-score-thr", type=float, default=0.25, help="Score threshold for recall/precision")
     p_frames.set_defaults(func=infer_frames)
+
+    p_cal = sub.add_parser("calibrate-blur", help="Calibrate blur thresholds from sample folders")
+    p_cal.add_argument(
+        "--sharp-dir",
+        type=Path,
+        required=True,
+        help="Folder of known-sharp frames (day, or curated sharp night frames)",
+    )
+    p_cal.add_argument(
+        "--blurred-dir",
+        type=Path,
+        required=True,
+        help="Folder of known-blurry frames (night motion blur, or curated blur)",
+    )
+    p_cal.add_argument("--metric", choices=("lap_var", "grad_mean", "combo"), default="combo")
+    p_cal.add_argument("--sharp-quantile", type=float, default=0.10, help="Lower quantile of sharp scores")
+    p_cal.add_argument("--blur-quantile", type=float, default=0.90, help="Upper quantile of blurred scores")
+    p_cal.add_argument(
+        "--out-json",
+        type=Path,
+        default=Path("outputs") / "realtime" / "result" / "blur_thresholds.json",
+        help="Write recommended thresholds here",
+    )
+    p_cal.set_defaults(func=calibrate_blur)
+
+    p_ms = sub.add_parser("infer-multistream", help="Inference on multiple camera/video sources")
+    p_ms.add_argument(
+        "--sources",
+        type=str,
+        nargs="+",
+        required=True,
+        help="One or more camera indices or video paths (e.g. 0 1 2 or rtsp://...)",
+    )
+    p_ms.add_argument("--max-frames", type=int, default=300, help="Stop after N processed frames (0=run forever)")
+    p_ms.add_argument("--queue-size", type=int, default=8, help="Per-camera queue size (frames)")
+    p_ms.add_argument("--image-size", type=int, nargs=2, default=(256, 256), metavar=("H", "W"))
+    p_ms.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
+    p_ms.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=Path("models") / "checkpoints" / "deblur_mobilenetv2_unet_torch_best.pt",
+    )
+    p_ms.add_argument("--out-dir", type=Path, default=Path("outputs") / "realtime")
+    p_ms.add_argument("--preprocess", choices=("none", "lowlight"), default="none")
+    p_ms.add_argument("--lowlight-method", type=str, default="best")
+    p_ms.add_argument("--blur-gate", action="store_true", help="Skip deblur when frame is already sharp")
+    p_ms.add_argument("--blur-metric", choices=("lap_var", "grad_mean", "combo"), default="combo")
+    p_ms.add_argument("--sharp-threshold", type=float, default=0.020)
+    p_ms.add_argument("--blur-threshold", type=float, default=0.008)
+    p_ms.add_argument("--report-every", type=int, default=60)
+    p_ms.add_argument("--fps-window-s", type=float, default=2.0)
+    p_ms.add_argument("--batch-size", type=int, default=6, help="Micro-batch size for inference")
+    p_ms.add_argument("--max-wait-ms", type=float, default=30.0, help="Max wait to fill a batch (0 disables)")
+    p_ms.add_argument("--pin-memory", action="store_true", help="Use pinned CPU memory + non-blocking H2D")
+    p_ms.add_argument("--fp16", action="store_true", help="Use CUDA autocast fp16 for faster inference")
+    p_ms.add_argument("--damage-detector", type=str, default="none", help="Damage detector: none|placeholder")
+    p_ms.add_argument("--damage-annotations", type=Path, default=None, help="Path to GT annotation JSON")
+    p_ms.add_argument("--damage-iou-thr", type=float, default=0.5, help="IoU threshold (e.g. 0.5)")
+    p_ms.add_argument("--damage-score-thr", type=float, default=0.25, help="Score threshold for recall/precision")
+    p_ms.set_defaults(func=infer_multistream)
 
     p_rand = sub.add_parser("infer-random", help="Inference on random images from data/split")
     p_rand.add_argument("--split", choices=("train", "val", "test"), default="test")
@@ -801,9 +1545,8 @@ def main() -> None:
         default=Path("models") / "checkpoints" / "deblur_mobilenetv2_unet_torch_best.pt",
     )
     p_rand.add_argument("--out-dir", type=Path, default=Path("outputs") / "realtime")
-    p_rand.add_argument("--preprocess", choices=("none", "lowlight", "denoise", "both"), default="none")
+    p_rand.add_argument("--preprocess", choices=("none", "lowlight"), default="none")
     p_rand.add_argument("--lowlight-method", type=str, default="best")
-    p_rand.add_argument("--denoise-method", type=str, default="best")
     p_rand.set_defaults(func=infer_random)
 
     args = parser.parse_args()
