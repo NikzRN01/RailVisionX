@@ -15,9 +15,4 @@ venv/
 Thumbs.db
 .vscode/
 
-# Data/model artifacts (keep structure, ignore large binaries)
-/data/split
-/models/checkpoints/
-/models/onnx/
-/models/engines/
-/outputs/
+
