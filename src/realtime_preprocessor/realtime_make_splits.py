@@ -85,9 +85,14 @@ def _copy_as_png(src: Path, dst: Path) -> None:
         )
 
 
-def _split_counts(n: int, train_ratio: float = 0.8, val_ratio: float = 0.1) -> tuple[int, int, int]:
-    n_train = int(n * 0.7)
-    n_val = int(n * 0.1)
+def _split_counts(n: int, train_ratio: float = 0.7, val_ratio: float = 0.1) -> tuple[int, int, int]:
+    train_ratio = float(train_ratio)
+    val_ratio = float(val_ratio)
+    if train_ratio <= 0.0 or val_ratio < 0.0 or (train_ratio + val_ratio) >= 1.0:
+        raise ValueError("Invalid ratios: require train_ratio>0, val_ratio>=0, and train_ratio+val_ratio<1")
+
+    n_train = int(n * train_ratio)
+    n_val = int(n * val_ratio)
     n_test = n - n_train - n_val
     return n_train, n_val, n_test
 
@@ -266,7 +271,7 @@ def main() -> None:
 
             rng.shuffle(pairs)
 
-            n_train, n_val, n_test = _split_counts(len(pairs), train_ratio=0.8, val_ratio=0.1)
+            n_train, n_val, n_test = _split_counts(len(pairs), train_ratio=0.7, val_ratio=0.1)
             train_pairs = pairs[:n_train]
             val_pairs = pairs[n_train : n_train + n_val]
             test_pairs = pairs[n_train + n_val :]
@@ -296,7 +301,7 @@ def main() -> None:
 
         rng.shuffle(images)
 
-        n_train, n_val, n_test = _split_counts(len(images), train_ratio=0.8, val_ratio=0.1)
+        n_train, n_val, n_test = _split_counts(len(images), train_ratio=0.7, val_ratio=0.1)
         train_imgs = images[:n_train]
         val_imgs = images[n_train : n_train + n_val]
         test_imgs = images[n_train + n_val :]
