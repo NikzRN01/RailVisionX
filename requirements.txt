@@ -12,3 +12,6 @@ pydot
 torch
 torchvision
 pytorch-msssim
+
+# Dashboard
+streamlit
