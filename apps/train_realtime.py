@@ -71,6 +71,39 @@ def _pick_device(device_flag: str):
     return torch.device("cpu")
 
 
+def _torch_load_checkpoint(path: Path, *, map_location):
+    """Load a torch checkpoint robustly across torch versions.
+
+    Prefers weights_only=True (safer) when supported. Some of our checkpoints
+    include metadata containing pathlib Path objects; in that case we allowlist
+    WindowsPath/PosixPath for weights_only loading. As a last resort (trusted
+    local checkpoints), falls back to weights_only=False.
+    """
+
+    import torch
+
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        # Older torch versions don't support weights_only.
+        return torch.load(path, map_location=map_location)
+    except Exception:
+        # Try allowlisting pathlib Path types (common in our saved metadata).
+        try:
+            from pathlib import PosixPath, WindowsPath
+
+            try:
+                from torch.serialization import add_safe_globals  # type: ignore
+
+                add_safe_globals([WindowsPath, PosixPath])
+            except Exception:
+                pass
+            return torch.load(path, map_location=map_location, weights_only=True)
+        except Exception:
+            # Last resort: trusted local checkpoints.
+            return torch.load(path, map_location=map_location, weights_only=False)
+
+
 def _preprocess_tensor_nchw01(x_in, *, mode: str, lowlight_method: str):
     """Apply optional preprocessing to NCHW float tensor in [0,1].
 
@@ -104,6 +137,45 @@ def _preprocess_tensor_nchw01(x_in, *, mode: str, lowlight_method: str):
 
     x_out = torch.stack(out_list, dim=0)
     return x_out.to(device, non_blocking=True)
+
+
+def _postprocess_rgb01(
+    img01,
+    *,
+    mode: str,
+    lowlight_method: str,
+    auto_lowlight_threshold: float,
+):
+    """Apply optional postprocessing to RGB HWC image in [0,1].
+
+    This runs on CPU via src/enhancement utilities.
+    """
+    if mode == "none":
+        return img01
+    if mode not in ("lowlight", "auto"):
+        raise ValueError("Unsupported postprocess mode. Use: none|lowlight|auto")
+
+    import numpy as np
+
+    from src.enhancement.lowlight_enhance import enhance_lowlight
+    from src.quality.lowlight_score import mean_intensity
+
+    arr = np.asarray(img01, dtype=np.float32)
+    if arr.max(initial=0.0) > 1.5:
+        arr = arr / 255.0
+    arr = np.clip(arr, 0.0, 1.0)
+
+    if mode == "auto":
+        thr = float(np.clip(float(auto_lowlight_threshold), 0.0, 1.0))
+        intensity = float(mean_intensity(arr))
+        if intensity >= thr:
+            return arr
+
+    out = enhance_lowlight(arr, method=lowlight_method)
+    out = np.asarray(out, dtype=np.float32)
+    if out.max(initial=0.0) > 1.5:
+        out = out / 255.0
+    return np.clip(out, 0.0, 1.0)
 
 
 def _plot_history(history: dict[str, list[float]], out_path: Path, epochs: int) -> None:
@@ -284,6 +356,8 @@ def infer_multistream(args: argparse.Namespace) -> None:
     device = _pick_device(args.device)
     h, w = int(args.image_size[0]), int(args.image_size[1])
     preprocess_mode = str(args.preprocess)
+    postprocess_mode = str(getattr(args, "postprocess", "none"))
+    auto_lowlight_threshold = float(getattr(args, "auto_lowlight_threshold", 0.35))
     lowlight_method = str(args.lowlight_method)
 
     gate = BlurGateConfig(
@@ -305,7 +379,7 @@ def infer_multistream(args: argparse.Namespace) -> None:
 
     model = build_deblur_mobilenetv2_torch(weights=None, backbone_trainable=False)
     ckpt = Path(args.checkpoint)
-    state = torch.load(ckpt, map_location=device)
+    state = _torch_load_checkpoint(ckpt, map_location=device)
     if isinstance(state, dict) and "state_dict" in state:
         state = state["state_dict"]
     model.load_state_dict(state)
@@ -382,6 +456,31 @@ def infer_multistream(args: argparse.Namespace) -> None:
     preds_orig: dict[str, list[Detection]] = {}
     preds_rest: dict[str, list[Detection]] = {}
 
+    tta = bool(getattr(args, "tta", False))
+
+    def _forward(x: torch.Tensor) -> torch.Tensor:
+        with torch.inference_mode():
+            if use_fp16:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    if tta:
+                        y0 = model(x)
+                        x1 = torch.flip(x, dims=[3])
+                        y1 = model(x1)
+                        y1 = torch.flip(y1, dims=[3])
+                        y = (y0 + y1) * 0.5
+                    else:
+                        y = model(x)
+            else:
+                if tta:
+                    y0 = model(x)
+                    x1 = torch.flip(x, dims=[3])
+                    y1 = model(x1)
+                    y1 = torch.flip(y1, dims=[3])
+                    y = (y0 + y1) * 0.5
+                else:
+                    y = model(x)
+        return y
+
     def _infer_batch(frames_hwc: list[np.ndarray]) -> np.ndarray:
         x_cpu = torch.from_numpy(np.stack([f.transpose(2, 0, 1) for f in frames_hwc], axis=0)).float().contiguous()
         if preprocess_mode != "none":
@@ -393,12 +492,7 @@ def infer_multistream(args: argparse.Namespace) -> None:
         if use_pin:
             x_cpu = x_cpu.pin_memory()
         x = x_cpu.to(device, non_blocking=True) if use_cuda else x_cpu
-        with torch.inference_mode():
-            if use_fp16:
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    y = model(x)
-            else:
-                y = model(x)
+        y = _forward(x)
         return y.detach().float().cpu().numpy()
 
     try:
@@ -465,6 +559,13 @@ def infer_multistream(args: argparse.Namespace) -> None:
             for cam_i, key, frame, pred, meta, tcap in zip(cams, keys, frames_hwc, preds_hwc, blur_meta, t_caps):
                 if bool(meta["skipped_deblur"]):
                     cam_stats[cam_i].skipped += 1
+
+                pred = _postprocess_rgb01(
+                    pred,
+                    mode=postprocess_mode,
+                    lowlight_method=lowlight_method,
+                    auto_lowlight_threshold=auto_lowlight_threshold,
+                )
 
                 m = restoration_metrics(frame, pred)
                 cam_dir = frames_dir / f"cam{cam_i}"
@@ -555,14 +656,36 @@ def infer_multistream(args: argparse.Namespace) -> None:
 def train(args: argparse.Namespace) -> None:
     import numpy as np
     import torch
+    import shutil
+    from datetime import datetime
 
     from src.enhancement.deblur_net_torch import build_deblur_mobilenetv2_torch
-    from src.realtime_preprocessor.realtime_dataloader import RealtimePairedFramesDataset, build_torch_dataloader
     from src.quality.blur_score import mean_gradient_magnitude, variance_of_laplacian
     from src.quality.lowlight_score import mean_intensity
 
     out_dir = Path(args.out_dir)
     _, _, _, result_dir = _ensure_out_dirs(out_dir)
+
+    ckpt_best_path = Path(getattr(args, "checkpoint_out", Path("models") / "checkpoints" / "deblur_mobilenetv2_unet_torch_best.pt"))
+    ckpt_last_path = Path(getattr(args, "checkpoint_last", Path("models") / "checkpoints" / "deblur_mobilenetv2_unet_torch_last.pt"))
+    ckpt_best_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Safety: snapshot current checkpoints so we can rollback if needed.
+    try:
+        to_backup: list[Path] = []
+        if ckpt_best_path.exists():
+            to_backup.append(ckpt_best_path)
+        if ckpt_last_path.exists():
+            to_backup.append(ckpt_last_path)
+        if to_backup:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            rb_dir = ckpt_best_path.parent / f"rollback_{ts}"
+            rb_dir.mkdir(parents=True, exist_ok=True)
+            for p in to_backup:
+                shutil.copy2(p, rb_dir / p.name)
+            print(f"Rollback snapshot saved to: {rb_dir}")
+    except Exception:
+        pass
 
     torch.manual_seed(int(args.seed))
     np.random.seed(int(args.seed))
@@ -588,37 +711,98 @@ def train(args: argparse.Namespace) -> None:
     preprocess_mode = str(args.preprocess)
     lowlight_method = str(args.lowlight_method)
 
-    train_ds = RealtimePairedFramesDataset(
-        split="train",
-        split_dir=args.realtime_split_dir,
-        image_size=(h, w),
-        as_torch=True,
-    )
-    val_ds = RealtimePairedFramesDataset(
-        split="val",
-        split_dir=args.realtime_split_dir,
-        image_size=(h, w),
-        as_torch=True,
-    )
+    aug_motion_blur = bool(getattr(args, "augment_motion_blur", False))
+    motion_blur_prob = float(getattr(args, "motion_blur_prob", 0.0))
+    motion_blur_max_len = int(getattr(args, "motion_blur_max_len", 15))
 
-    train_loader = build_torch_dataloader(
-        train_ds,
-        batch_size=micro_batch,
-        shuffle=True,
-        num_workers=int(args.num_workers),
-        pin_memory=(device.type == "cuda"),
-    )
-    val_loader = build_torch_dataloader(
-        val_ds,
-        batch_size=micro_batch,
-        shuffle=False,
-        num_workers=int(args.num_workers),
-        pin_memory=(device.type == "cuda"),
-    )
+    train_dataset = str(getattr(args, "train_dataset", "realtime"))
+
+    if train_dataset == "data":
+        from src.preprocessor.dataloader import PairedDeblurDataset
+        from src.preprocessor.dataloader import build_torch_dataloader as _build_dl
+
+        data_dir = getattr(args, "data_dir", None)
+        train_ds = PairedDeblurDataset(
+            split="train",
+            data_dir=data_dir,
+            image_size=(h, w),
+            augment_motion_blur=aug_motion_blur,
+            motion_blur_prob=motion_blur_prob,
+            motion_blur_max_len=motion_blur_max_len,
+            seed=int(args.seed),
+            as_torch=True,
+        )
+        val_ds = PairedDeblurDataset(
+            split="val",
+            data_dir=data_dir,
+            image_size=(h, w),
+            augment_motion_blur=False,
+            motion_blur_prob=0.0,
+            motion_blur_max_len=motion_blur_max_len,
+            seed=int(args.seed),
+            as_torch=True,
+        )
+
+        train_loader = _build_dl(
+            train_ds,
+            batch_size=micro_batch,
+            shuffle=True,
+            num_workers=int(args.num_workers),
+            pin_memory=(device.type == "cuda"),
+        )
+        val_loader = _build_dl(
+            val_ds,
+            batch_size=micro_batch,
+            shuffle=False,
+            num_workers=int(args.num_workers),
+            pin_memory=(device.type == "cuda"),
+        )
+    else:
+        from src.realtime_preprocessor.realtime_dataloader import RealtimePairedFramesDataset
+        from src.realtime_preprocessor.realtime_dataloader import build_torch_dataloader as _build_dl
+
+        train_ds = RealtimePairedFramesDataset(
+            split="train",
+            split_dir=args.realtime_split_dir,
+            image_size=(h, w),
+            as_torch=True,
+        )
+        val_ds = RealtimePairedFramesDataset(
+            split="val",
+            split_dir=args.realtime_split_dir,
+            image_size=(h, w),
+            as_torch=True,
+        )
+
+        train_loader = _build_dl(
+            train_ds,
+            batch_size=micro_batch,
+            shuffle=True,
+            num_workers=int(args.num_workers),
+            pin_memory=(device.type == "cuda"),
+        )
+        val_loader = _build_dl(
+            val_ds,
+            batch_size=micro_batch,
+            shuffle=False,
+            num_workers=int(args.num_workers),
+            pin_memory=(device.type == "cuda"),
+        )
 
     weights = None if str(args.weights).lower() in ("none", "null") else str(args.weights)
     model = build_deblur_mobilenetv2_torch(weights=weights, backbone_trainable=bool(args.backbone_trainable))
     model.to(device)
+
+    # Optional: initialize from an existing checkpoint (quick fine-tune).
+    init_ckpt = getattr(args, "init_checkpoint", None)
+    if init_ckpt is not None:
+        p = Path(init_ckpt)
+        if p.exists():
+            st = _torch_load_checkpoint(p, map_location=device)
+            if isinstance(st, dict) and "state_dict" in st:
+                st = st["state_dict"]
+            model.load_state_dict(st)
+            print(f"Initialized weights from: {p}")
 
     def charbonnier(y_true: torch.Tensor, y_pred: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
         return torch.mean(torch.sqrt((y_true - y_pred) ** 2 + eps * eps))
@@ -801,6 +985,7 @@ def train(args: argparse.Namespace) -> None:
         }
 
     epochs = int(args.epochs)
+    best_val_loss: float | None = None
     for epoch in range(1, epochs + 1):
         train_m = run_epoch(train_loader, train_mode=True)
         val_m = run_epoch(val_loader, train_mode=False)
@@ -845,6 +1030,25 @@ def train(args: argparse.Namespace) -> None:
 
         (result_dir / "history_torch_realtime.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
 
+        # Always save a "last" checkpoint, and update "best" on improved val_loss.
+        try:
+            payload = {
+                "state_dict": model.state_dict(),
+                "epoch": int(epoch),
+                "train": train_m,
+                "val": val_m,
+                "args": vars(args),
+            }
+            torch.save(payload, ckpt_last_path)
+
+            v = float(val_m["loss"])
+            if best_val_loss is None or v < best_val_loss:
+                best_val_loss = v
+                torch.save(payload, ckpt_best_path)
+        except Exception:
+            # Training should not fail just because checkpoint writing failed.
+            pass
+
     try:
         import pandas as pd  # type: ignore
 
@@ -870,16 +1074,22 @@ def infer_random(args: argparse.Namespace) -> None:
     device = _pick_device(args.device)
     h, w = int(args.image_size[0]), int(args.image_size[1])
     preprocess_mode = str(args.preprocess)
+    postprocess_mode = str(getattr(args, "postprocess", "none"))
+    auto_lowlight_threshold = float(getattr(args, "auto_lowlight_threshold", 0.35))
     lowlight_method = str(args.lowlight_method)
 
     model = build_deblur_mobilenetv2_torch(weights=None, backbone_trainable=False)
     ckpt = Path(args.checkpoint)
-    state = torch.load(ckpt, map_location=device)
+    state = _torch_load_checkpoint(ckpt, map_location=device)
     if isinstance(state, dict) and "state_dict" in state:
         state = state["state_dict"]
     model.load_state_dict(state)
     model.to(device)
     model.eval()
+
+    use_cuda = device.type == "cuda"
+    use_fp16 = bool(getattr(args, "fp16", False)) and use_cuda
+    tta = bool(getattr(args, "tta", False))
 
     ds = RandomSplitInferenceDataset(split=args.split, kind="blurred", image_size=(h, w), as_torch=True)
     rng = random.Random(int(args.seed))
@@ -903,17 +1113,40 @@ def infer_random(args: argparse.Namespace) -> None:
                 lowlight_method=lowlight_method,
             )
         x = x.to(device)
-        with torch.no_grad():
-            pred = model(x).squeeze(0).detach().cpu()
+        with torch.inference_mode():
+            if use_fp16:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    if tta:
+                        y0 = model(x)
+                        y1 = model(torch.flip(x, dims=[3]))
+                        y1 = torch.flip(y1, dims=[3])
+                        y = (y0 + y1) * 0.5
+                    else:
+                        y = model(x)
+            else:
+                if tta:
+                    y0 = model(x)
+                    y1 = model(torch.flip(x, dims=[3]))
+                    y1 = torch.flip(y1, dims=[3])
+                    y = (y0 + y1) * 0.5
+                else:
+                    y = model(x)
+            pred = y.squeeze(0).detach().float().cpu()
 
         # Compute simple restoration score from input/output only
         blurred_hwc = item["image"].detach().cpu().numpy().transpose(1, 2, 0)
         restored_hwc = pred.detach().cpu().numpy().transpose(1, 2, 0)
+        restored_hwc = _postprocess_rgb01(
+            restored_hwc,
+            mode=postprocess_mode,
+            lowlight_method=lowlight_method,
+            auto_lowlight_threshold=auto_lowlight_threshold,
+        )
         m = restoration_metrics(blurred_hwc, restored_hwc)
         metrics_rows.append({"key": key, **m.as_dict()})
 
         _save_rgb01_png(item["image"], original_dir / f"{key}.png")
-        _save_rgb01_png(pred, restored_dir / f"{key}.png")
+        _save_rgb01_png(restored_hwc, restored_dir / f"{key}.png")
 
         # Optional groundtruth from data/split/<split>/sharp/<key>.png
         gt_path = REPO_ROOT / "data" / "split" / str(args.split) / "sharp" / f"{key}.png"
@@ -959,6 +1192,8 @@ def infer_stream(args: argparse.Namespace) -> None:
     device = _pick_device(args.device)
     h, w = int(args.image_size[0]), int(args.image_size[1])
     preprocess_mode = str(args.preprocess)
+    postprocess_mode = str(getattr(args, "postprocess", "none"))
+    auto_lowlight_threshold = float(getattr(args, "auto_lowlight_threshold", 0.35))
     lowlight_method = str(args.lowlight_method)
 
     gate = BlurGateConfig(
@@ -971,9 +1206,11 @@ def infer_stream(args: argparse.Namespace) -> None:
     fpsw = FpsWindow(window_s=float(args.fps_window_s))
     stats = TimingStats()
 
+    select_best_of = max(1, int(getattr(args, "select_best_of", 1)))
+
     model = build_deblur_mobilenetv2_torch(weights=None, backbone_trainable=False)
     ckpt = Path(args.checkpoint)
-    state = torch.load(ckpt, map_location=device)
+    state = _torch_load_checkpoint(ckpt, map_location=device)
     if isinstance(state, dict) and "state_dict" in state:
         state = state["state_dict"]
     model.load_state_dict(state)
@@ -985,6 +1222,7 @@ def infer_stream(args: argparse.Namespace) -> None:
     use_pin = bool(args.pin_memory) and use_cuda
     batch_size = max(1, int(args.batch_size))
     max_wait_ms = max(0.0, float(args.max_wait_ms))
+    tta = bool(getattr(args, "tta", False))
 
     src: str = args.source
     source: int | str = int(src) if src.isdigit() else src
@@ -1025,16 +1263,63 @@ def infer_stream(args: argparse.Namespace) -> None:
         with torch.inference_mode():
             if use_fp16:
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    y = model(x)
+                    if tta:
+                        y0 = model(x)
+                        x1 = torch.flip(x, dims=[3])
+                        y1 = model(x1)
+                        y1 = torch.flip(y1, dims=[3])
+                        y = (y0 + y1) * 0.5
+                    else:
+                        y = model(x)
             else:
-                y = model(x)
+                if tta:
+                    y0 = model(x)
+                    x1 = torch.flip(x, dims=[3])
+                    y1 = model(x1)
+                    y1 = torch.flip(y1, dims=[3])
+                    y = (y0 + y1) * 0.5
+                else:
+                    y = model(x)
         return y.detach().float().cpu()
 
     batch: list[dict[str, object]] = []
     batch_started = time.perf_counter()
     frame_idx = 0
 
-    for item in stream:
+    it = iter(stream)
+    while True:
+        try:
+            item0 = next(it)
+        except StopIteration:
+            break
+
+        # Optional: select the sharpest of the next N frames (by blur score).
+        # This helps with motion blur in videos by avoiding the worst-smeared frames.
+        if select_best_of > 1:
+            candidates: list[dict[str, object]] = [item0]
+            for _ in range(select_best_of - 1):
+                try:
+                    candidates.append(next(it))
+                except StopIteration:
+                    break
+
+            best_item = candidates[0]
+            best_score = None
+            for cand in candidates:
+                frame_chw = cand["frame"]
+                if not hasattr(frame_chw, "detach"):
+                    continue
+                frame_chw_t = frame_chw.detach().cpu().contiguous()
+                blurred_hwc = frame_chw_t.numpy().transpose(1, 2, 0)
+                bs = compute_blur_score(blurred_hwc, metric=gate.metric)
+                score = float(bs.score)
+                if best_score is None or score > best_score:
+                    best_item = cand
+                    best_score = score
+            item = best_item
+        else:
+            item = item0
+
         frame_idx += 1
         batch.append(item)
 
@@ -1075,6 +1360,7 @@ def infer_stream(args: argparse.Namespace) -> None:
                     "blur_lap_var": float(bs.lap_var),
                     "blur_grad_mean": float(bs.grad_mean),
                     "skipped_deblur": bool(skip),
+                    "select_best_of": int(select_best_of),
                 }
             )
             run_mask.append(not skip)
@@ -1118,10 +1404,16 @@ def infer_stream(args: argparse.Namespace) -> None:
         t_save0 = time.perf_counter()
         for key, frame_chw_t, pred_chw, blurred_hwc, m0 in zip(keys, frames_chw, preds, blurred_hwcs, meta):
             restored_hwc = pred_chw.detach().cpu().numpy().transpose(1, 2, 0)
+            restored_hwc = _postprocess_rgb01(
+                restored_hwc,
+                mode=postprocess_mode,
+                lowlight_method=lowlight_method,
+                auto_lowlight_threshold=auto_lowlight_threshold,
+            )
             m = restoration_metrics(blurred_hwc, restored_hwc)
             metrics_rows.append({"key": key, **m0, **m.as_dict()})
             _save_rgb01_png(frame_chw_t, original_dir / f"{key}.png")
-            _save_rgb01_png(pred_chw, restored_dir / f"{key}.png")
+            _save_rgb01_png(restored_hwc, restored_dir / f"{key}.png")
 
             if detector is not None:
                 try:
@@ -1209,6 +1501,8 @@ def infer_frames(args: argparse.Namespace) -> None:
     device = _pick_device(args.device)
     h, w = int(args.image_size[0]), int(args.image_size[1])
     preprocess_mode = str(args.preprocess)
+    postprocess_mode = str(getattr(args, "postprocess", "none"))
+    auto_lowlight_threshold = float(getattr(args, "auto_lowlight_threshold", 0.35))
     lowlight_method = str(args.lowlight_method)
 
     gate = BlurGateConfig(
@@ -1223,12 +1517,16 @@ def infer_frames(args: argparse.Namespace) -> None:
 
     model = build_deblur_mobilenetv2_torch(weights=None, backbone_trainable=False)
     ckpt = Path(args.checkpoint)
-    state = torch.load(ckpt, map_location=device)
+    state = _torch_load_checkpoint(ckpt, map_location=device)
     if isinstance(state, dict) and "state_dict" in state:
         state = state["state_dict"]
     model.load_state_dict(state)
     model.to(device)
     model.eval()
+
+    use_cuda = device.type == "cuda"
+    use_fp16 = bool(getattr(args, "fp16", False)) and use_cuda
+    tta = bool(getattr(args, "tta", False))
 
     ds = RealtimeFolderFramesDataset(root_dir=args.frames_dir, image_size=(h, w), as_torch=True)
     loader = build_torch_dataloader(ds, batch_size=1, shuffle=False, num_workers=0)
@@ -1273,11 +1571,34 @@ def infer_frames(args: argparse.Namespace) -> None:
             x = x.to(device)
 
             t_inf0 = time.perf_counter()
-            with torch.no_grad():
-                pred = model(x).squeeze(0).detach().cpu()
+            with torch.inference_mode():
+                if use_fp16:
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        if tta:
+                            y0 = model(x)
+                            y1 = model(torch.flip(x, dims=[3]))
+                            y1 = torch.flip(y1, dims=[3])
+                            y = (y0 + y1) * 0.5
+                        else:
+                            y = model(x)
+                else:
+                    if tta:
+                        y0 = model(x)
+                        y1 = model(torch.flip(x, dims=[3]))
+                        y1 = torch.flip(y1, dims=[3])
+                        y = (y0 + y1) * 0.5
+                    else:
+                        y = model(x)
+                pred = y.squeeze(0).detach().float().cpu()
             t_inf = time.perf_counter() - t_inf0
 
         restored_hwc = pred.detach().cpu().numpy().transpose(1, 2, 0)
+        restored_hwc = _postprocess_rgb01(
+            restored_hwc,
+            mode=postprocess_mode,
+            lowlight_method=lowlight_method,
+            auto_lowlight_threshold=auto_lowlight_threshold,
+        )
         m = restoration_metrics(blurred_hwc, restored_hwc)
         metrics_rows.append(
             {
@@ -1300,7 +1621,7 @@ def infer_frames(args: argparse.Namespace) -> None:
 
         t_save0 = time.perf_counter()
         _save_rgb01_png(frame_chw, original_dir / f"{key}.png")
-        _save_rgb01_png(pred, restored_dir / f"{key}.png")
+        _save_rgb01_png(restored_hwc, restored_dir / f"{key}.png")
         t_save = time.perf_counter() - t_save0
 
         t_total = time.perf_counter() - t0
@@ -1370,14 +1691,81 @@ def main() -> None:
             "- train: trains on paired realtime_data/spilts/{train,val}/...\n"
             "- infer-stream: runs webcam/video inference\n"
             "- infer-frames: runs inference on a folder of frames\n"
-            "- infer-random: runs inference on random images from data/split"
+            "- infer-random: runs inference on random images from data/split\n"
+            "- prep-extract: extract video frames into realtime_data/raw\n"
+            "- prep-split: split realtime_data/raw into realtime_data/spilts"
         )
     )
 
     sub = parser.add_subparsers(dest="cmd", required=True)
 
+    def prep_extract(args: argparse.Namespace) -> None:
+        from src.realtime_preprocessor.realtime_make_splits import extract_to_raw
+
+        src: str = str(args.source)
+        if src.isdigit():
+            source: int | str = int(src)
+        else:
+            raw_dir = Path(args.raw_dir)
+            rel = Path(src)
+            if rel.is_absolute():
+                raise SystemExit("--source must be a filename under --raw-dir (absolute paths are not allowed)")
+
+            candidate = (raw_dir / rel).resolve()
+            raw_res = raw_dir.resolve()
+            try:
+                ok = candidate.is_relative_to(raw_res)
+            except AttributeError:
+                ok = str(candidate).lower().startswith(str(raw_res).lower())
+
+            if not ok:
+                raise SystemExit("--source must point inside --raw-dir")
+            if not candidate.exists():
+                raise SystemExit(f"Video not found under --raw-dir: {rel}")
+            source = str(candidate)
+        max_frames = None if int(args.max_frames) <= 0 else int(args.max_frames)
+        n = extract_to_raw(
+            source=source,
+            raw_dir=Path(args.raw_dir),
+            out_kind=str(args.out_kind),
+            stride=int(args.stride),
+            max_frames=max_frames,
+            prefix=str(args.prefix),
+        )
+        print(f"Extracted {n} frames into: {Path(args.raw_dir) / args.out_kind}")
+
+    def prep_split(args: argparse.Namespace) -> None:
+        from src.realtime_preprocessor.realtime_make_splits import split_raw_to_spilts
+
+        counts = split_raw_to_spilts(
+            raw_dir=Path(args.raw_dir),
+            out_dir=Path(args.out_dir),
+            mode=str(args.mode),
+            seed=int(args.seed),
+            clean=bool(args.clean),
+            limit=int(args.limit),
+            train_ratio=float(args.train_ratio),
+            val_ratio=float(args.val_ratio),
+        )
+        print(
+            f"Wrote splits to: {Path(args.out_dir)}\n"
+            f"Total: {counts['total']}  train: {counts['train']}  val: {counts['val']}  test: {counts['test']}"
+        )
+
     p_train = sub.add_parser("train", help="Train on paired realtime images")
     p_train.add_argument("--realtime-split-dir", type=Path, default=None, help="Defaults to realtime_data/spilts")
+    p_train.add_argument(
+        "--train-dataset",
+        choices=("realtime", "data"),
+        default="realtime",
+        help="Train dataset source: realtime (realtime_data/spilts) or data (data/split).",
+    )
+    p_train.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data") / "split",
+        help="Used when --train-dataset=data. Points to the split root containing train/val/test folders.",
+    )
     p_train.add_argument("--image-size", type=int, nargs=2, default=(256, 256), metavar=("H", "W"))
     p_train.add_argument("--epochs", type=int, default=10)
     p_train.add_argument("--batch-size", type=int, default=32)
@@ -1396,7 +1784,39 @@ def main() -> None:
         default="none",
         help="Optional preprocessing applied to INPUT frames before the model (runs on CPU; slower).",
     )
-    p_train.add_argument("--lowlight-method", type=str, default="best")
+    p_train.add_argument(
+        "--augment-motion-blur",
+        action="store_true",
+        help="Augment training inputs with synthetic motion blur (helps moving vehicles/plates).",
+    )
+    p_train.add_argument(
+        "--motion-blur-prob",
+        type=float,
+        default=0.25,
+        help="When --augment-motion-blur is enabled, probability of applying motion blur per training sample.",
+    )
+    p_train.add_argument(
+        "--motion-blur-max-len",
+        type=int,
+        default=15,
+        help="When --augment-motion-blur is enabled, maximum motion blur kernel length.",
+    )
+    _ll_methods = (
+        "best",
+        "plates",
+        "plates-strong",
+        "auto-gamma",
+        "clahe",
+        "unsharp",
+        "auto-gamma+clahe",
+        "auto-gamma+clahe+unsharp",
+    )
+    p_train.add_argument(
+        "--lowlight-method",
+        choices=_ll_methods,
+        default="best",
+        help="Lowlight enhancement pipeline used by --preprocess/--postprocess.",
+    )
     p_train.add_argument(
         "--quality-metrics",
         action="store_true",
@@ -1406,6 +1826,25 @@ def main() -> None:
         ),
     )
     p_train.add_argument(
+        "--checkpoint-out",
+        type=Path,
+        default=Path("models") / "checkpoints" / "deblur_mobilenetv2_unet_torch_best.pt",
+        help="Where to save the best checkpoint (by lowest val_loss).",
+    )
+    p_train.add_argument(
+        "--checkpoint-last",
+        type=Path,
+        default=Path("models") / "checkpoints" / "deblur_mobilenetv2_unet_torch_last.pt",
+        help="Where to save the last checkpoint (overwritten each epoch).",
+    )
+
+    p_train.add_argument(
+        "--init-checkpoint",
+        type=Path,
+        default=None,
+        help="Optional checkpoint to initialize weights from (quick fine-tune).",
+    )
+    p_train.add_argument(
         "--quality-max-batches",
         type=int,
         default=5,
@@ -1413,9 +1852,58 @@ def main() -> None:
     )
     p_train.set_defaults(func=train)
 
+    p_prep_extract = sub.add_parser("prep-extract", help="Extract frames from camera/video into realtime_data/raw")
+    p_prep_extract.add_argument("--raw-dir", type=Path, default=Path("realtime_data") / "raw")
+    p_prep_extract.add_argument(
+        "--source",
+        type=str,
+        default="0",
+        help="Camera index (e.g. 0) or VIDEO FILENAME under --raw-dir (e.g. myvideo.mp4)",
+    )
+    p_prep_extract.add_argument("--stride", type=int, default=1, help="Keep every Nth frame")
+    p_prep_extract.add_argument("--max-frames", type=int, default=0, help="0 = no limit")
+    p_prep_extract.add_argument("--prefix", type=str, default="frame")
+    p_prep_extract.add_argument(
+        "--out-kind",
+        choices=["frames", "blurred"],
+        default="frames",
+        help="Subfolder under raw/ to write frames into",
+    )
+    p_prep_extract.set_defaults(func=prep_extract)
+
+    p_prep_split = sub.add_parser("prep-split", help="Split realtime_data/raw into realtime_data/spilts")
+    p_prep_split.add_argument("--raw-dir", type=Path, default=Path("realtime_data") / "raw")
+    p_prep_split.add_argument(
+        "--out-dir",
+        type=Path,
+        default=Path("realtime_data") / "spilts",
+        help="Output directory for train/val/test",
+    )
+    p_prep_split.add_argument("--seed", type=int, default=42)
+    p_prep_split.add_argument("--clean", action="store_true")
+    p_prep_split.add_argument(
+        "--mode",
+        choices=["auto", "paired", "unpaired"],
+        default="auto",
+        help="auto: paired if raw/blurred+raw/sharp exist else unpaired",
+    )
+    p_prep_split.add_argument("--limit", type=int, default=0, help="0 = no limit")
+    p_prep_split.add_argument("--train-ratio", type=float, default=0.7)
+    p_prep_split.add_argument("--val-ratio", type=float, default=0.1)
+    p_prep_split.set_defaults(func=prep_split)
+
     p_stream = sub.add_parser("infer-stream", help="Inference on webcam/video")
     p_stream.add_argument("--source", type=str, default="0", help="Camera index (0) or video path")
     p_stream.add_argument("--stride", type=int, default=1)
+    p_stream.add_argument(
+        "--select-best-of",
+        type=int,
+        default=1,
+        help=(
+            "For videos: read N frames and process only the sharpest one (by blur score). "
+            "Improves plate readability under motion blur, but reduces temporal resolution."
+        ),
+    )
     p_stream.add_argument("--max-frames", type=int, default=200)
     p_stream.add_argument("--image-size", type=int, nargs=2, default=(256, 256), metavar=("H", "W"))
     p_stream.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
@@ -1426,7 +1914,27 @@ def main() -> None:
     )
     p_stream.add_argument("--out-dir", type=Path, default=Path("outputs") / "realtime")
     p_stream.add_argument("--preprocess", choices=("none", "lowlight"), default="none")
-    p_stream.add_argument("--lowlight-method", type=str, default="best")
+    p_stream.add_argument(
+        "--postprocess",
+        choices=("none", "lowlight", "auto"),
+        default="none",
+        help=(
+            "Optional postprocessing applied to RESTORED frames after the model (runs on CPU; slower). "
+            "Use 'auto' to only enhance frames detected as low-light."
+        ),
+    )
+    p_stream.add_argument(
+        "--auto-lowlight-threshold",
+        type=float,
+        default=0.35,
+        help="When --postprocess=auto, enhance only if mean intensity < threshold (0..1).",
+    )
+    p_stream.add_argument(
+        "--lowlight-method",
+        choices=_ll_methods,
+        default="best",
+        help="Lowlight enhancement pipeline used by --preprocess/--postprocess.",
+    )
     p_stream.add_argument("--blur-gate", action="store_true", help="Skip deblur when frame is already sharp")
     p_stream.add_argument("--blur-metric", choices=("lap_var", "grad_mean", "combo"), default="combo")
     p_stream.add_argument("--sharp-threshold", type=float, default=0.020, help="Skip deblur if score >= this")
@@ -1437,6 +1945,11 @@ def main() -> None:
     p_stream.add_argument("--max-wait-ms", type=float, default=30.0, help="Max wait to fill a batch (0 disables)")
     p_stream.add_argument("--pin-memory", action="store_true", help="Use pinned CPU memory + non-blocking H2D")
     p_stream.add_argument("--fp16", action="store_true", help="Use CUDA autocast fp16 for faster inference")
+    p_stream.add_argument(
+        "--tta",
+        action="store_true",
+        help="Test-time augmentation (hflip ensembling). Improves quality slightly but ~2x slower.",
+    )
     p_stream.add_argument("--damage-detector", type=str, default="none", help="Damage detector: none|placeholder")
     p_stream.add_argument("--damage-annotations", type=Path, default=None, help="Path to GT annotation JSON")
     p_stream.add_argument("--damage-iou-thr", type=float, default=0.5, help="IoU threshold (e.g. 0.5)")
@@ -1460,13 +1973,38 @@ def main() -> None:
     )
     p_frames.add_argument("--out-dir", type=Path, default=Path("outputs") / "realtime")
     p_frames.add_argument("--preprocess", choices=("none", "lowlight"), default="none")
-    p_frames.add_argument("--lowlight-method", type=str, default="best")
+    p_frames.add_argument(
+        "--postprocess",
+        choices=("none", "lowlight", "auto"),
+        default="none",
+        help=(
+            "Optional postprocessing applied to RESTORED frames after the model (runs on CPU; slower). "
+            "Use 'auto' to only enhance frames detected as low-light."
+        ),
+    )
+    p_frames.add_argument(
+        "--auto-lowlight-threshold",
+        type=float,
+        default=0.35,
+        help="When --postprocess=auto, enhance only if mean intensity < threshold (0..1).",
+    )
+    p_frames.add_argument(
+        "--lowlight-method",
+        choices=_ll_methods,
+        default="best",
+        help="Lowlight enhancement pipeline used by --preprocess/--postprocess.",
+    )
     p_frames.add_argument("--blur-gate", action="store_true", help="Skip deblur when frame is already sharp")
     p_frames.add_argument("--blur-metric", choices=("lap_var", "grad_mean", "combo"), default="combo")
     p_frames.add_argument("--sharp-threshold", type=float, default=0.020, help="Skip deblur if score >= this")
     p_frames.add_argument("--blur-threshold", type=float, default=0.008, help="Severe blur if score <= this")
     p_frames.add_argument("--report-every", type=int, default=30, help="Print telemetry JSON every N frames")
     p_frames.add_argument("--fps-window-s", type=float, default=2.0, help="Sliding window size for FPS")
+    p_frames.add_argument(
+        "--tta",
+        action="store_true",
+        help="Test-time augmentation (hflip ensembling). Improves quality slightly but ~2x slower.",
+    )
     p_frames.add_argument("--damage-detector", type=str, default="none", help="Damage detector: none|placeholder")
     p_frames.add_argument("--damage-annotations", type=Path, default=None, help="Path to GT annotation JSON")
     p_frames.add_argument("--damage-iou-thr", type=float, default=0.5, help="IoU threshold (e.g. 0.5)")
@@ -1516,7 +2054,27 @@ def main() -> None:
     )
     p_ms.add_argument("--out-dir", type=Path, default=Path("outputs") / "realtime")
     p_ms.add_argument("--preprocess", choices=("none", "lowlight"), default="none")
-    p_ms.add_argument("--lowlight-method", type=str, default="best")
+    p_ms.add_argument(
+        "--postprocess",
+        choices=("none", "lowlight", "auto"),
+        default="none",
+        help=(
+            "Optional postprocessing applied to RESTORED frames after the model (runs on CPU; slower). "
+            "Use 'auto' to only enhance frames detected as low-light."
+        ),
+    )
+    p_ms.add_argument(
+        "--auto-lowlight-threshold",
+        type=float,
+        default=0.35,
+        help="When --postprocess=auto, enhance only if mean intensity < threshold (0..1).",
+    )
+    p_ms.add_argument(
+        "--lowlight-method",
+        choices=_ll_methods,
+        default="best",
+        help="Lowlight enhancement pipeline used by --preprocess/--postprocess.",
+    )
     p_ms.add_argument("--blur-gate", action="store_true", help="Skip deblur when frame is already sharp")
     p_ms.add_argument("--blur-metric", choices=("lap_var", "grad_mean", "combo"), default="combo")
     p_ms.add_argument("--sharp-threshold", type=float, default=0.020)
@@ -1527,6 +2085,11 @@ def main() -> None:
     p_ms.add_argument("--max-wait-ms", type=float, default=30.0, help="Max wait to fill a batch (0 disables)")
     p_ms.add_argument("--pin-memory", action="store_true", help="Use pinned CPU memory + non-blocking H2D")
     p_ms.add_argument("--fp16", action="store_true", help="Use CUDA autocast fp16 for faster inference")
+    p_ms.add_argument(
+        "--tta",
+        action="store_true",
+        help="Test-time augmentation (hflip ensembling). Improves quality slightly but ~2x slower.",
+    )
     p_ms.add_argument("--damage-detector", type=str, default="none", help="Damage detector: none|placeholder")
     p_ms.add_argument("--damage-annotations", type=Path, default=None, help="Path to GT annotation JSON")
     p_ms.add_argument("--damage-iou-thr", type=float, default=0.5, help="IoU threshold (e.g. 0.5)")
@@ -1540,13 +2103,43 @@ def main() -> None:
     p_rand.add_argument("--image-size", type=int, nargs=2, default=(256, 256), metavar=("H", "W"))
     p_rand.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     p_rand.add_argument(
+        "--fp16",
+        action="store_true",
+        help="Use CUDA autocast fp16 for faster inference",
+    )
+    p_rand.add_argument(
+        "--tta",
+        action="store_true",
+        help="Test-time augmentation (hflip ensembling). Improves quality slightly but ~2x slower.",
+    )
+    p_rand.add_argument(
         "--checkpoint",
         type=Path,
         default=Path("models") / "checkpoints" / "deblur_mobilenetv2_unet_torch_best.pt",
     )
     p_rand.add_argument("--out-dir", type=Path, default=Path("outputs") / "realtime")
     p_rand.add_argument("--preprocess", choices=("none", "lowlight"), default="none")
-    p_rand.add_argument("--lowlight-method", type=str, default="best")
+    p_rand.add_argument(
+        "--postprocess",
+        choices=("none", "lowlight", "auto"),
+        default="none",
+        help=(
+            "Optional postprocessing applied to RESTORED frames after the model (runs on CPU; slower). "
+            "Use 'auto' to only enhance frames detected as low-light."
+        ),
+    )
+    p_rand.add_argument(
+        "--auto-lowlight-threshold",
+        type=float,
+        default=0.35,
+        help="When --postprocess=auto, enhance only if mean intensity < threshold (0..1).",
+    )
+    p_rand.add_argument(
+        "--lowlight-method",
+        choices=_ll_methods,
+        default="best",
+        help="Lowlight enhancement pipeline used by --preprocess/--postprocess.",
+    )
     p_rand.set_defaults(func=infer_random)
 
     args = parser.parse_args()
