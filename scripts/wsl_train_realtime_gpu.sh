@@ -8,7 +8,25 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+if [[ ! -f /proc/version ]] || ! grep -qi microsoft /proc/version; then
+	echo "[wsl_train_realtime_gpu] This script must be run inside WSL." >&2
+	echo "[wsl_train_realtime_gpu] On Windows, use .venv instead." >&2
+	exit 1
+fi
+
+if [[ ! -d ".venv-wsl" ]]; then
+	echo "[wsl_train_realtime_gpu] Missing .venv-wsl. Create it first:" >&2
+	echo "  bash scripts/wsl_setup_ubuntu_gpu.sh" >&2
+	exit 1
+fi
+
 source .venv-wsl/bin/activate
+
+python - <<'PY'
+import sys
+if sys.version_info >= (3, 13):
+    print('[wsl_train_realtime_gpu][warn] Python 3.13+ detected. If installs fail, consider using Ubuntu WSL with Python 3.11/3.12.')
+PY
 
 # Ensure torch deps exist in this venv
 python -m pip install -r requirements-wsl.txt
