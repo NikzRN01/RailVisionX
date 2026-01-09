@@ -26,11 +26,7 @@
 - [Project Structure](#project-structure)
 - [Training Pipeline](#training-pipeline)
 - [Evaluation & Metrics](#evaluation--metrics)
-- [Deployment](#deployment)
-- [Configuration](#configuration)
-- [Documentation](#documentation)
 - [Performance](#performance)
-- [Contributing](#contributing)
 - [License](#license)
 
 ---
