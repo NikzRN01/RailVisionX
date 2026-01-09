@@ -159,11 +159,11 @@ def main():
             
             col1, col2 = st.columns(2)
             with col1:
-                st.image(img1, caption="Blurred", use_container_width=True)
+                st.image(img1, caption="Blurred", width="stretch")
             with col2:
-                st.image(img2, caption="Deblurred", use_container_width=True)
+                st.image(img2, caption="Deblurred", width="stretch")
             
-            st.image(diff_heatmap, caption=f"Difference Heatmap ({colormap})", use_container_width=True)
+            st.image(diff_heatmap, caption=f"Difference Heatmap ({colormap})", width="stretch")
             
             # Stats
             diff = np.abs(img1.astype(np.float32) - img2.astype(np.float32)) / 255.0
@@ -212,9 +212,9 @@ def main():
             
             col1, col2 = st.columns(2)
             with col1:
-                st.image(img1_overlay, caption="Blurred with Metrics", use_container_width=True)
+                st.image(img1_overlay, caption="Blurred with Metrics", width="stretch")
             with col2:
-                st.image(img2_overlay, caption="Deblurred with Metrics", use_container_width=True)
+                st.image(img2_overlay, caption="Deblurred with Metrics", width="stretch")
         
         else:  # All Views
             st.markdown("### 📑 All Visualization Modes")
@@ -234,7 +234,7 @@ def main():
             # 3. Heatmap
             st.markdown("#### 3️⃣ Difference Heatmap")
             diff_heatmap = image_diff_heatmap(img1, img2, 'hot')
-            st.image(diff_heatmap, caption="Difference Heatmap", use_container_width=True)
+            st.image(diff_heatmap, caption="Difference Heatmap", width="stretch")
             
             st.markdown("---")
             
@@ -251,7 +251,7 @@ def main():
             }
             
             img2_overlay = image_metrics_overlay(img2, metrics, "top-left")
-            st.image(img2_overlay, caption="Deblurred with Metrics", use_container_width=True)
+            st.image(img2_overlay, caption="Deblurred with Metrics", width="stretch")
     
     else:
         st.info("👆 Select an image source from the sidebar to begin comparison")

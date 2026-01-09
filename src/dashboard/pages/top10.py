@@ -144,7 +144,7 @@ def main():
         st.markdown(f"### 🎯 Top {k} {ranking_mode.split()[0]} Frames")
         st.dataframe(
             df[['Rank', 'Image', 'Score']],
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
         
@@ -181,7 +181,7 @@ def main():
             col1, col2 = st.columns([2, 1])
             
             with col1:
-                st.image(img, caption=f"Rank #{selected_rank} - {images[idx][1]}", use_container_width=True)
+                st.image(img, caption=f"Rank #{selected_rank} - {images[idx][1]}", width="stretch")
             
             with col2:
                 st.markdown("#### Frame Details")

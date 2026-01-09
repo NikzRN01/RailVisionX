@@ -362,10 +362,10 @@ def main():
                 # Display frames
                 blurred_placeholder.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), 
                                          caption="Blurred Input", 
-                                         use_container_width=True)
+                                         width="stretch")
                 sharp_placeholder.image(deblurred, 
                                        caption="Deblurred Output", 
-                                       use_container_width=True)
+                                       width="stretch")
                 
                 # Save snapshot if requested
                 if snapshot_button:
@@ -450,8 +450,8 @@ def main():
                 for idx, snap in enumerate(st.session_state.saved_frames):
                     with st.expander(f"Snapshot {idx+1} - Frame {snap['frame_num']}"):
                         col1, col2 = st.columns(2)
-                        col1.image(snap['blurred'], caption="Blurred", use_container_width=True)
-                        col2.image(snap['deblurred'], caption="Deblurred", use_container_width=True)
+                        col1.image(snap['blurred'], caption="Blurred", width="stretch")
+                        col2.image(snap['deblurred'], caption="Deblurred", width="stretch")
                         m = snap['metrics']
                         st.markdown(f"""
                         **Blur Score:** {m['blurred']['laplacian_variance']:.3f} → {m['deblurred']['laplacian_variance']:.3f} ({m['improvements']['sharpness']:+.1f}%)  
@@ -514,10 +514,10 @@ def main():
                     if frame_count % 10 == 0:
                         blurred_placeholder.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), 
                                                  caption=f"Frame {frame_count}/{total_frames}", 
-                                                 use_container_width=True)
+                                                 width="stretch")
                         sharp_placeholder.image(deblurred, 
                                                caption=f"Deblurred {frame_count}/{total_frames}", 
-                                               use_container_width=True)
+                                               width="stretch")
                         
                         progress_bar.progress(frame_count / total_frames)
                     
@@ -577,26 +577,26 @@ def main():
                     st.line_chart({
                         "Blurred": chart_data["Blurred Sharpness"],
                         "Deblurred": chart_data["Deblurred Sharpness"],
-                    }, use_container_width=True)
+                    }, width="stretch")
                 
                 with col2:
                     st.markdown("**Inference Time**")
                     st.line_chart({
                         "Inference Time (ms)": chart_data["Inference Time (ms)"]
-                    }, use_container_width=True)
+                    }, width="stretch")
                 
                 col3, col4 = st.columns(2)
                 with col3:
                     st.markdown("**SSIM Score**")
                     st.line_chart({
                         "SSIM": chart_data["SSIM"]
-                    }, use_container_width=True)
+                    }, width="stretch")
                 
                 with col4:
                     st.markdown("**PSNR (dB)**")
                     st.line_chart({
                         "PSNR": chart_data["PSNR"]
-                    }, use_container_width=True)
+                    }, width="stretch")
 
 
 if __name__ == "__main__":

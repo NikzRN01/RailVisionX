@@ -237,7 +237,7 @@ def image_compare_grid(images: list, labels: list = None, columns: int = 2):
                 if img.dtype != np.uint8:
                     img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
             
-            st.image(img, caption=label, use_container_width=True)
+            st.image(img, caption=label, width="stretch")
 
 
 def image_diff_heatmap(img1: np.ndarray, img2: np.ndarray, colormap: str = 'hot'):

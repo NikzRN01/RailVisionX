@@ -758,21 +758,46 @@ def train(args: argparse.Namespace) -> None:
             pin_memory=(device.type == "cuda"),
         )
     else:
-        from src.realtime_preprocessor.realtime_dataloader import RealtimePairedFramesDataset
         from src.realtime_preprocessor.realtime_dataloader import build_torch_dataloader as _build_dl
 
-        train_ds = RealtimePairedFramesDataset(
-            split="train",
-            split_dir=args.realtime_split_dir,
-            image_size=(h, w),
-            as_torch=True,
-        )
-        val_ds = RealtimePairedFramesDataset(
-            split="val",
-            split_dir=args.realtime_split_dir,
-            image_size=(h, w),
-            as_torch=True,
-        )
+        if train_dataset == "realtime-synthetic":
+            from src.realtime_preprocessor.realtime_dataloader import RealtimeSyntheticPairsDataset
+
+            train_ds = RealtimeSyntheticPairsDataset(
+                split="train",
+                split_dir=args.realtime_split_dir,
+                image_size=(h, w),
+                seed=int(args.seed),
+                augment_motion_blur=aug_motion_blur,
+                motion_blur_prob=motion_blur_prob,
+                motion_blur_max_len=motion_blur_max_len,
+                as_torch=True,
+            )
+            val_ds = RealtimeSyntheticPairsDataset(
+                split="val",
+                split_dir=args.realtime_split_dir,
+                image_size=(h, w),
+                seed=int(args.seed) + 1337,
+                augment_motion_blur=aug_motion_blur,
+                motion_blur_prob=max(0.0, motion_blur_prob * 0.5),
+                motion_blur_max_len=motion_blur_max_len,
+                as_torch=True,
+            )
+        else:
+            from src.realtime_preprocessor.realtime_dataloader import RealtimePairedFramesDataset
+
+            train_ds = RealtimePairedFramesDataset(
+                split="train",
+                split_dir=args.realtime_split_dir,
+                image_size=(h, w),
+                as_torch=True,
+            )
+            val_ds = RealtimePairedFramesDataset(
+                split="val",
+                split_dir=args.realtime_split_dir,
+                image_size=(h, w),
+                as_torch=True,
+            )
 
         train_loader = _build_dl(
             train_ds,
@@ -1286,10 +1311,10 @@ def infer_stream(args: argparse.Namespace) -> None:
     batch_started = time.perf_counter()
     frame_idx = 0
 
-    it = iter(stream)
+    stream_it = iter(stream)
     while True:
         try:
-            item0 = next(it)
+            item0 = next(stream_it)
         except StopIteration:
             break
 
@@ -1299,7 +1324,7 @@ def infer_stream(args: argparse.Namespace) -> None:
             candidates: list[dict[str, object]] = [item0]
             for _ in range(select_best_of - 1):
                 try:
-                    candidates.append(next(it))
+                    candidates.append(next(stream_it))
                 except StopIteration:
                     break
 
@@ -1337,9 +1362,9 @@ def infer_stream(args: argparse.Namespace) -> None:
         meta: list[dict[str, object]] = []
         run_mask: list[bool] = []
 
-        for it in batch:
-            key = str(it["key"])
-            frame_chw = it["frame"]
+        for b in batch:
+            key = str(b["key"])
+            frame_chw = b["frame"]
             if not hasattr(frame_chw, "detach"):
                 raise RuntimeError("Expected torch frames from RealtimeStream(as_torch=True)")
 
@@ -1756,9 +1781,13 @@ def main() -> None:
     p_train.add_argument("--realtime-split-dir", type=Path, default=None, help="Defaults to realtime_data/spilts")
     p_train.add_argument(
         "--train-dataset",
-        choices=("realtime", "data"),
+        choices=("realtime", "realtime-synthetic", "data"),
         default="realtime",
-        help="Train dataset source: realtime (realtime_data/spilts) or data (data/split).",
+        help=(
+            "Train dataset source: realtime (paired realtime_data/spilts), "
+            "realtime-synthetic (unpaired realtime_data/spilts + synthetic blur), "
+            "or data (data/split)."
+        ),
     )
     p_train.add_argument(
         "--data-dir",

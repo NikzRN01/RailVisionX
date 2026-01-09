@@ -80,13 +80,13 @@ def _to_chw(img: ArrayAny) -> ArrayAny:
 
 
 def _resize_hwc_rgb01(img01: RGBFloat32, size_hw: tuple[int, int]) -> RGBFloat32:
-        """Resize HWC RGB float32 image in [0,1].
+    """Resize HWC RGB float32 image in [0,1].
 
-        Prefers Pillow when available; falls back to OpenCV.
-        Uses interpolation that preserves detail:
-            - downscale: AREA
-            - upscale: CUBIC
-        """
+    Prefers Pillow when available; falls back to OpenCV.
+    Uses interpolation that preserves detail:
+        - downscale: AREA
+        - upscale: CUBIC
+    """
     h, w = int(size_hw[0]), int(size_hw[1])
     try:
         from PIL import Image  # type: ignore
@@ -376,6 +376,215 @@ class RealtimePairedFramesDataset:
             "blurred": blurred01,
             "sharp": sharp01,
             "blurred_path": str(b.path),
+            "sharp_path": str(s.path),
+        }
+
+        if self.transform is not None:
+            item = self.transform(item)
+
+        if self.as_torch:
+            try:
+                import torch  # type: ignore
+
+                item["blurred"] = torch.from_numpy(_to_chw(item["blurred"])).float()
+                item["sharp"] = torch.from_numpy(_to_chw(item["sharp"])).float()
+            except ImportError as e:
+                raise RuntimeError("as_torch=True requires PyTorch installed.") from e
+
+        return item
+
+
+class RealtimeSyntheticPairsDataset:
+    """Synthetic paired (blurred, sharp) dataset from *unpaired* frames.
+
+    This is intended for training when you only have a single video / frames folder.
+    We treat each frame as the (approx.) sharp target and generate a degraded
+    blurred input on-the-fly.
+
+    Expects an *unpaired* split layout (created by prep-split --mode unpaired):
+      split_dir/<split>/blurred/*.png
+
+    Returns dict:
+      - key
+      - blurred
+      - sharp
+    """
+
+    def __init__(
+        self,
+        split: SplitName | None = None,
+        split_dir: Path | str | None = None,
+        image_size: tuple[int, int] | None = (256, 256),
+        seed: int = 42,
+        augment_motion_blur: bool = True,
+        motion_blur_prob: float = 0.25,
+        motion_blur_max_len: int = 15,
+        defocus_blur_prob: float = 0.35,
+        defocus_blur_max_ksize: int = 7,
+        jpeg_prob: float = 0.35,
+        jpeg_quality_min: int = 35,
+        jpeg_quality_max: int = 90,
+        noise_prob: float = 0.25,
+        noise_std_max: float = 0.03,
+        gamma_prob: float = 0.20,
+        gamma_min: float = 0.70,
+        gamma_max: float = 1.40,
+        transform: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
+        as_torch: bool = False,
+    ) -> None:
+        self.split = split
+        self.split_dir = Path(split_dir) if split_dir is not None else _default_realtime_split_dir()
+        self.image_size = image_size
+        self.seed = int(seed)
+        self.augment_motion_blur = bool(augment_motion_blur)
+        self.motion_blur_prob = float(motion_blur_prob)
+        self.motion_blur_max_len = int(motion_blur_max_len)
+
+        self.defocus_blur_prob = float(defocus_blur_prob)
+        self.defocus_blur_max_ksize = int(defocus_blur_max_ksize)
+        self.jpeg_prob = float(jpeg_prob)
+        self.jpeg_quality_min = int(jpeg_quality_min)
+        self.jpeg_quality_max = int(jpeg_quality_max)
+        self.noise_prob = float(noise_prob)
+        self.noise_std_max = float(noise_std_max)
+        self.gamma_prob = float(gamma_prob)
+        self.gamma_min = float(gamma_min)
+        self.gamma_max = float(gamma_max)
+
+        self.transform = transform
+        self.as_torch = as_torch
+
+        if self.split is None:
+            raise ValueError("split is required (train|val|test)")
+
+        # For unpaired splits we store frames under <split>/blurred.
+        frames_dir = self.split_dir / str(self.split) / "blurred"
+        self.samples = _discover_images(frames_dir)
+        if not self.samples:
+            raise RuntimeError(
+                f"No frames found for synthetic training in: {frames_dir}. "
+                "Run 'prep-extract' then 'prep-split --mode unpaired' first."
+            )
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def _rng_for(self, idx: int):
+        import numpy as np
+
+        # Deterministic per-index RNG (safe under DataLoader workers).
+        return np.random.default_rng(self.seed + 1009 * int(idx))
+
+    def _apply_defocus_blur(self, img01, *, rng):
+        import numpy as np
+
+        kmax = max(3, int(self.defocus_blur_max_ksize))
+        k = int(rng.integers(3, kmax + 1))
+        if k % 2 == 0:
+            k += 1
+
+        try:
+            import cv2  # type: ignore
+
+            img8 = (np.clip(img01, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+            bgr = cv2.cvtColor(img8, cv2.COLOR_RGB2BGR)
+            b = cv2.GaussianBlur(bgr, (k, k), sigmaX=0)
+            rgb = cv2.cvtColor(b, cv2.COLOR_BGR2RGB)
+            return rgb.astype(np.float32) / 255.0
+        except Exception:
+            return img01
+
+    def _apply_jpeg(self, img01, *, rng):
+        import numpy as np
+
+        qmin = int(self.jpeg_quality_min)
+        qmax = int(self.jpeg_quality_max)
+        if qmax < qmin:
+            qmin, qmax = qmax, qmin
+        qmin = int(np.clip(qmin, 5, 100))
+        qmax = int(np.clip(qmax, 5, 100))
+        quality = int(rng.integers(qmin, qmax + 1))
+
+        try:
+            import cv2  # type: ignore
+
+            img8 = (np.clip(img01, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+            bgr = cv2.cvtColor(img8, cv2.COLOR_RGB2BGR)
+            ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+            if not ok:
+                return img01
+            dec = cv2.imdecode(enc, cv2.IMREAD_COLOR)
+            if dec is None:
+                return img01
+            rgb = cv2.cvtColor(dec, cv2.COLOR_BGR2RGB)
+            return rgb.astype(np.float32) / 255.0
+        except Exception:
+            return img01
+
+    def _apply_noise(self, img01, *, rng):
+        import numpy as np
+
+        std = float(rng.uniform(0.0, max(0.0, float(self.noise_std_max))))
+        if std <= 0.0:
+            return img01
+        noise = rng.normal(0.0, std, size=img01.shape).astype(np.float32)
+        return np.clip(img01 + noise, 0.0, 1.0)
+
+    def _apply_gamma(self, img01, *, rng):
+        import numpy as np
+
+        gmin = float(self.gamma_min)
+        gmax = float(self.gamma_max)
+        if gmax < gmin:
+            gmin, gmax = gmax, gmin
+        g = float(rng.uniform(gmin, gmax))
+        g = float(np.clip(g, 0.2, 3.0))
+        return np.clip(np.power(np.clip(img01, 0.0, 1.0), g), 0.0, 1.0)
+
+    def _degrade(self, sharp01, *, rng):
+        import numpy as np
+
+        blurred = np.asarray(sharp01, dtype=np.float32)
+
+        if self.gamma_prob > 0.0 and float(rng.random()) < float(np.clip(self.gamma_prob, 0.0, 1.0)):
+            blurred = self._apply_gamma(blurred, rng=rng)
+
+        if self.defocus_blur_prob > 0.0 and float(rng.random()) < float(np.clip(self.defocus_blur_prob, 0.0, 1.0)):
+            blurred = self._apply_defocus_blur(blurred, rng=rng)
+
+        if self.augment_motion_blur and self.motion_blur_prob > 0.0:
+            if float(rng.random()) < float(np.clip(self.motion_blur_prob, 0.0, 1.0)):
+                try:
+                    from src.preprocessor.dataloader import _apply_motion_blur_rgb01
+
+                    blurred = _apply_motion_blur_rgb01(blurred, rng=rng, max_len=self.motion_blur_max_len)
+                except Exception:
+                    pass
+
+        if self.jpeg_prob > 0.0 and float(rng.random()) < float(np.clip(self.jpeg_prob, 0.0, 1.0)):
+            blurred = self._apply_jpeg(blurred, rng=rng)
+
+        if self.noise_prob > 0.0 and float(rng.random()) < float(np.clip(self.noise_prob, 0.0, 1.0)):
+            blurred = self._apply_noise(blurred, rng=rng)
+
+        return np.clip(blurred, 0.0, 1.0)
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        s = self.samples[idx]
+        if s.path is None:
+            raise RuntimeError("Sample has no path")
+
+        sharp01 = _to_float01(_read_image_rgb(s.path))
+        if self.image_size is not None:
+            sharp01 = _resize_hwc_rgb01(sharp01, self.image_size)
+
+        rng = self._rng_for(idx)
+        blurred01 = self._degrade(sharp01, rng=rng)
+
+        item: dict[str, Any] = {
+            "key": s.key,
+            "blurred": blurred01,
+            "sharp": sharp01,
             "sharp_path": str(s.path),
         }
 

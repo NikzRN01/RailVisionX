@@ -5,6 +5,7 @@ __pycache__/
 *.pyo
 *.egg-info/
 .venv/
+.venv311/
 .venv-wsl/
 # Jupyter
 .ipynb_checkpoints/
@@ -15,9 +16,9 @@ Thumbs.db
 .vscode/
 
 # Project outputs / artifacts
-outputs/realtime_tta
+outputs/
+realtime_data/raw/
+realtime_data/splits/
 
 # Model checkpoints (large binary artifacts)
-models/checkpoints/rollback_*/
-
-
+models/
