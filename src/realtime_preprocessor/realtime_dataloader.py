@@ -80,7 +80,13 @@ def _to_chw(img: ArrayAny) -> ArrayAny:
 
 
 def _resize_hwc_rgb01(img01: RGBFloat32, size_hw: tuple[int, int]) -> RGBFloat32:
-    """Resize HWC RGB float32 image in [0,1] using Pillow."""
+        """Resize HWC RGB float32 image in [0,1].
+
+        Prefers Pillow when available; falls back to OpenCV.
+        Uses interpolation that preserves detail:
+            - downscale: AREA
+            - upscale: CUBIC
+        """
     h, w = int(size_hw[0]), int(size_hw[1])
     try:
         from PIL import Image  # type: ignore
@@ -92,7 +98,20 @@ def _resize_hwc_rgb01(img01: RGBFloat32, size_hw: tuple[int, int]) -> RGBFloat32
         im = im.resize((w, h), resample=resampling.BILINEAR)
         return np.array(im, dtype=np.uint8).astype(np.float32) / 255.0
     except ImportError:
-        # If PIL isn't available, return as-is.
+        pass
+
+    try:
+        import cv2  # type: ignore
+
+        ih, iw = int(img01.shape[0]), int(img01.shape[1])
+        if ih == h and iw == w:
+            return img01
+
+        interp = cv2.INTER_AREA if (h < ih or w < iw) else cv2.INTER_CUBIC
+        out = cv2.resize(img01, (w, h), interpolation=interp)
+        return out.astype(np.float32)
+    except ImportError:
+        # If no backend is available, return as-is.
         return img01
 
 

@@ -142,7 +142,56 @@ def unsharp_mask_rgb(
 	return (sharp.astype(np.float32) / 255.0).astype(np.float32)
 
 
-EnhanceMethod = Literal["best", "auto-gamma", "clahe", "unsharp", "auto-gamma+clahe", "auto-gamma+clahe+unsharp"]
+def unsharp_mask_luma_rgb(
+	img: ArrayAny,
+	*,
+	amount: float = 0.6,
+	sigma: float = 1.0,
+	threshold: int = 0,
+) -> RGBFloat32:
+	"""Unsharp mask applied only to luminance (LAB L) channel.
+
+	This tends to preserve color fidelity and reduces grainy artifacts compared
+	to sharpening all RGB channels.
+
+	Returns float32 RGB in [0,1]. Requires OpenCV.
+	"""
+	try:
+		import cv2  # type: ignore
+	except ImportError as e:
+		raise RuntimeError("Luma unsharp masking requires OpenCV. Install 'opencv-python' or 'opencv-python-headless'.") from e
+
+	img01, _ = _as_float01_rgb(img)
+	img8 = _to_uint8_rgb(img01)
+
+	# Convert RGB->LAB via OpenCV BGR
+	bgr = cv2.cvtColor(img8, cv2.COLOR_RGB2BGR)
+	lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+	l, a, b = cv2.split(lab)
+
+	blurred = cv2.GaussianBlur(l, ksize=(0, 0), sigmaX=float(sigma))
+	sharp_l = cv2.addWeighted(l, 1.0 + float(amount), blurred, -float(amount), 0)
+
+	if int(threshold) > 0:
+		low_contrast = np.abs(l.astype(np.int16) - blurred.astype(np.int16)) < int(threshold)
+		sharp_l = np.where(low_contrast, l, sharp_l).astype(np.uint8)
+
+	lab2 = cv2.merge([sharp_l, a, b])
+	bgr2 = cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
+	rgb2 = cv2.cvtColor(bgr2, cv2.COLOR_BGR2RGB)
+	return (rgb2.astype(np.float32) / 255.0).astype(np.float32)
+
+
+EnhanceMethod = Literal[
+	"best",
+	"plates",
+	"plates-strong",
+	"auto-gamma",
+	"clahe",
+	"unsharp",
+	"auto-gamma+clahe",
+	"auto-gamma+clahe+unsharp",
+]
 
 
 def enhance_lowlight(
@@ -164,6 +213,38 @@ def enhance_lowlight(
 	pipeline = method
 	if pipeline == "best":
 		pipeline = "auto-gamma+clahe+unsharp"
+	if pipeline == "plates":
+		# Plate/vehicle-friendly preset:
+		# - still improves luminance and local contrast
+		# - avoids the harsher sharpening that can create halos/cartoon-ish edges
+		plates_cfg = LowLightEnhanceConfig(
+			target_mean=0.45,
+			gamma_min=0.70,
+			gamma_max=1.80,
+			clahe_clip_limit=1.60,
+			clahe_tile_grid_size=(8, 8),
+			unsharp_amount=0.30,
+			unsharp_sigma=1.00,
+			unsharp_threshold=2,
+		)
+		cfg = plates_cfg
+		pipeline = "auto-gamma+clahe+unsharp"
+	if pipeline == "plates-strong":
+		# More aggressive preset for readability:
+		# - stronger local contrast
+		# - stronger sharpening (may introduce halos/noise)
+		plates_cfg = LowLightEnhanceConfig(
+			target_mean=0.50,
+			gamma_min=0.60,
+			gamma_max=2.00,
+			clahe_clip_limit=2.60,
+			clahe_tile_grid_size=(8, 8),
+			unsharp_amount=0.85,
+			unsharp_sigma=0.90,
+			unsharp_threshold=0,
+		)
+		cfg = plates_cfg
+		pipeline = "auto-gamma+clahe+unsharp"
 
 	out: RGBFloat32 = img01
 	if pipeline in ("auto-gamma", "auto-gamma+clahe", "auto-gamma+clahe+unsharp"):
@@ -171,7 +252,11 @@ def enhance_lowlight(
 	if pipeline in ("clahe", "auto-gamma+clahe", "auto-gamma+clahe+unsharp"):
 		out = clahe_rgb(out, clip_limit=cfg.clahe_clip_limit, tile_grid_size=cfg.clahe_tile_grid_size)
 	if pipeline in ("unsharp", "auto-gamma+clahe+unsharp"):
-		out = unsharp_mask_rgb(out, amount=cfg.unsharp_amount, sigma=cfg.unsharp_sigma, threshold=cfg.unsharp_threshold)
+		# For plate-focused presets, sharpen luminance only to reduce artifacts.
+		if method in ("plates", "plates-strong"):
+			out = unsharp_mask_luma_rgb(out, amount=cfg.unsharp_amount, sigma=cfg.unsharp_sigma, threshold=cfg.unsharp_threshold)
+		else:
+			out = unsharp_mask_rgb(out, amount=cfg.unsharp_amount, sigma=cfg.unsharp_sigma, threshold=cfg.unsharp_threshold)
 
 	if was_u8:
 		return _to_uint8_rgb(out)

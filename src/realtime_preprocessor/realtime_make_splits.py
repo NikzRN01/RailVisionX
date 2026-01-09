@@ -173,6 +173,100 @@ def extract_frames_to_raw(
     return emitted
 
 
+def extract_to_raw(
+    *,
+    source: int | str,
+    raw_dir: Path,
+    out_kind: Literal["blurred", "frames"] = "frames",
+    stride: int = 1,
+    max_frames: int | None = None,
+    prefix: str = "frame",
+) -> int:
+    """Convenience wrapper around extract_frames_to_raw with sane defaults."""
+    return extract_frames_to_raw(
+        source,
+        raw_dir,
+        out_kind=out_kind,
+        stride=stride,
+        max_frames=max_frames,
+        prefix=prefix,
+    )
+
+
+def split_raw_to_spilts(
+    *,
+    raw_dir: Path,
+    out_dir: Path,
+    mode: Literal["auto", "paired", "unpaired"] = "auto",
+    seed: int = 42,
+    clean: bool = False,
+    limit: int = 0,
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.1,
+) -> dict[str, int]:
+    """Split realtime_data/raw into realtime_data/spilts (paired or unpaired).
+
+    Returns counts dict: {"total": N, "train": n_train, "val": n_val, "test": n_test}.
+    """
+    raw_dir = Path(raw_dir)
+    out_dir = Path(out_dir)
+
+    actual_mode: str = mode
+    if actual_mode == "auto":
+        if (raw_dir / "blurred").exists() and (raw_dir / "sharp").exists():
+            actual_mode = "paired"
+        else:
+            actual_mode = "unpaired"
+
+    if clean:
+        _clean_out_dir(out_dir)
+
+    rng = random.Random(int(seed))
+
+    if actual_mode == "paired":
+        pairs = discover_pairs(raw_dir)
+        if limit and int(limit) > 0:
+            pairs = pairs[: int(limit)]
+        if not pairs:
+            raise RuntimeError(
+                f"No paired images found under '{raw_dir}'. Expected matching filenames in blurred/ and sharp/."
+            )
+
+        rng.shuffle(pairs)
+        n_train, n_val, n_test = _split_counts(len(pairs), train_ratio=float(train_ratio), val_ratio=float(val_ratio))
+        train_pairs = pairs[:n_train]
+        val_pairs = pairs[n_train : n_train + n_val]
+        test_pairs = pairs[n_train + n_val :]
+
+        write_paired_split(train_pairs, out_dir, "train")
+        write_paired_split(val_pairs, out_dir, "val")
+        write_paired_split(test_pairs, out_dir, "test")
+
+        return {"total": len(pairs), "train": len(train_pairs), "val": len(val_pairs), "test": len(test_pairs)}
+
+    # unpaired
+    images = discover_unpaired(raw_dir, kind="blurred")
+    if limit and int(limit) > 0:
+        images = images[: int(limit)]
+    if not images:
+        raise RuntimeError(
+            f"No images found under '{raw_dir}/blurred' or '{raw_dir}/frames'. "
+            "Put images there first (or run the extract step)."
+        )
+
+    rng.shuffle(images)
+    n_train, n_val, n_test = _split_counts(len(images), train_ratio=float(train_ratio), val_ratio=float(val_ratio))
+    train_imgs = images[:n_train]
+    val_imgs = images[n_train : n_train + n_val]
+    test_imgs = images[n_train + n_val :]
+
+    write_unpaired_split(train_imgs, out_dir, "train")
+    write_unpaired_split(val_imgs, out_dir, "val")
+    write_unpaired_split(test_imgs, out_dir, "test")
+
+    return {"total": len(images), "train": len(train_imgs), "val": len(val_imgs), "test": len(test_imgs)}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -223,13 +317,36 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.cmd == "extract":
-        src: str = args.source
-        source: int | str
+    def _resolve_source_in_raw(raw_dir: Path, src: str) -> int | str:
+        """Resolve --source for extract.
+
+        - If numeric, treat as camera index.
+        - Otherwise, treat as a filename/path relative to raw_dir, and reject anything outside raw_dir.
+        """
         if src.isdigit():
-            source = int(src)
-        else:
-            source = src
+            return int(src)
+
+        raw_dir = Path(raw_dir)
+        rel = Path(src)
+        if rel.is_absolute():
+            raise SystemExit("--source must be a filename under --raw-dir (absolute paths are not allowed)")
+
+        candidate = (raw_dir / rel).resolve()
+        raw_res = raw_dir.resolve()
+        try:
+            ok = candidate.is_relative_to(raw_res)
+        except AttributeError:
+            ok = str(candidate).lower().startswith(str(raw_res).lower())
+
+        if not ok:
+            raise SystemExit("--source must point inside --raw-dir")
+        if not candidate.exists():
+            raise SystemExit(f"Video not found under --raw-dir: {rel}")
+        return str(candidate)
+
+    if args.cmd == "extract":
+        src: str = str(args.source)
+        source = _resolve_source_in_raw(Path(args.raw_dir), src)
 
         max_frames = None if int(args.max_frames) <= 0 else int(args.max_frames)
         n = extract_frames_to_raw(
