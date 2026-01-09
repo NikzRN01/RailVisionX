@@ -16,13 +16,55 @@ from src.quality.lowlight_score import mean_intensity
 
 # Model configuration
 MODEL_INPUT_SIZE = (256, 256)
-MODEL_WEIGHTS_PATH = Path("outputs/checkpoints/deblur_mobilenet_unet.pth")
+
+# Default model paths (checked in order of preference)
+DEFAULT_MODEL_PATHS = [
+    Path("models/checkpoints/deblur_mobilenetv2_unet_torch_best.pt"),  # Standard training output
+    Path("outputs/result/best_model.pt"),  # Alternative location
+]
 
 
 @st.cache_resource
 def load_model(device: str):
-    """Load and cache the deblur model."""
-    model = DeblurMobileNetV2UNet().to(device)
+    """Load and cache the deblur model.
+    
+    Searches for trained weights in default locations. Falls back to ImageNet-pretrained
+    encoder if no trained weights found.
+    
+    Args:
+        device: Device to load model on ('cuda' or 'cpu')
+    
+    Returns:
+        Loaded model in eval mode
+    """
+    model = DeblurMobileNetV2UNet(weights=None, backbone_trainable=False).to(device)
+    
+    # Search for trained weights
+    weights_found = None
+    for model_path in DEFAULT_MODEL_PATHS:
+        if model_path.exists():
+            weights_found = model_path
+            break
+    
+    # Load weights if found
+    if weights_found:
+        try:
+            state = torch.load(weights_found, map_location=device, weights_only=False)
+            # Handle both checkpoint dict and raw state_dict
+            if isinstance(state, dict) and "state_dict" in state:
+                state = state["state_dict"]
+            model.load_state_dict(state)
+            st.sidebar.success(f"✅ Model: {weights_found.name}")
+        except Exception as e:
+            st.sidebar.error(f"❌ Load failed: {str(e)[:50]}")
+            st.sidebar.warning("⚠️ Using untrained model")
+    else:
+        st.sidebar.warning("⚠️ No trained model found")
+        st.sidebar.info("🎓 Using ImageNet-pretrained encoder only")
+        with st.sidebar.expander("📍 Searched locations"):
+            for path in DEFAULT_MODEL_PATHS:
+                st.code(str(path))
+    
     model.eval()
     return model
 
@@ -217,11 +259,11 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     st.info(f"Using device: {device}")
     
-    # Load model
+    # Load model (searches default paths automatically)
     model = load_model(device)
     
     # Input source selection
-    st.sidebar.markdown("## Input Source")
+    st.sidebar.markdown("## 📹 Input Source")
     input_source = st.sidebar.radio("Select input source:", ["Webcam", "Upload Video"])
     
     frames_data = []
