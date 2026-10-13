@@ -14,3 +14,5 @@ pytorch-msssim
 
 # Dashboard
 streamlit
+plotly
+scikit-image
