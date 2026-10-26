@@ -147,9 +147,9 @@ def main():
     inject_theme()
 
     st.markdown(f"""
-    <h1 style="margin-bottom:4px;">🏆 Top-K Frame Rankings</h1>
+    <h1 style="margin-bottom:4px;">📊 Explore image quality</h1>
     <p style="color:{TEXT_MUTED};margin-bottom:24px;">
-        Rank and inspect frames by quality metric · Identify best and worst captures
+        Rank frames by sharpness, edge strength, brightness, or blur to quickly find the ones worth reviewing.
     </p>
     """, unsafe_allow_html=True)
 

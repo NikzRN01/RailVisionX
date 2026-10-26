@@ -79,9 +79,9 @@ def main():
     inject_theme()
 
     st.markdown(f"""
-    <h1 style="margin-bottom:4px;">🔍 Frame Comparison</h1>
+    <h1 style="margin-bottom:4px;">🔍 Compare two images</h1>
     <p style="color:{TEXT_MUTED};margin-bottom:24px;">
-        Interactive before / after comparison with heatmaps and quality metrics
+        Upload two images or use the prepared test set to see a clear before / after view.
     </p>
     """, unsafe_allow_html=True)
 

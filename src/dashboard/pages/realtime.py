@@ -303,9 +303,9 @@ def metric_row_html(metrics: dict, fps: float, frame_num: int, inf_ms: float) ->
 def main():
     inject_theme()
     st.markdown(f"""
-    <h1 style="margin-bottom:4px;">🎬 Real-time Deblurring</h1>
+    <h1 style="margin-bottom:4px;">🎬 Enhance a video</h1>
     <p style="color:{TEXT_MUTED};margin-bottom:24px;">
-        Live inference with MobileNetV2 GAN · Quality metrics tracked per frame
+        Choose a webcam or upload a clip. Live quality metrics are available while it runs.
     </p>
     """, unsafe_allow_html=True)
 
@@ -326,7 +326,7 @@ def main():
     # ── Sidebar ────────────────────────────────────────────────────────────────
     st.sidebar.markdown(f"<h4 style='color:{ACCENT_CYAN};'>📹 Input Source</h4>",
                         unsafe_allow_html=True)
-    input_source = st.sidebar.radio("Source", ["Webcam", "Upload Video"],
+    input_source = st.sidebar.radio("Source", ["Use webcam", "Upload a video"],
                                     label_visibility="collapsed")
 
     frames_data = []
@@ -334,7 +334,7 @@ def main():
     # ══════════════════════════════════════════════════════════════════════════
     # WEBCAM
     # ══════════════════════════════════════════════════════════════════════════
-    if input_source == "Webcam":
+    if input_source == "Use webcam":
         st.sidebar.markdown(f"<h4 style='color:{ACCENT_CYAN};'>⏱ Capture Duration</h4>",
                             unsafe_allow_html=True)
         use_duration     = st.sidebar.checkbox("Auto-stop after duration", value=False)
