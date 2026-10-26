@@ -126,7 +126,7 @@ def show_home():
             st.button(
                 label,
                 key=f"home_{title}",
-                use_container_width=True,
+                width="stretch",
                 on_click=_navigate,
                 args=(destination,),
             )

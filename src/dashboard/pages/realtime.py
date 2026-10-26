@@ -63,11 +63,11 @@ def load_model(device: str):
             model.load_state_dict(state)
             st.sidebar.success(f"✅ Model: {weights_found.name}")
         except Exception as e:
-            st.sidebar.error(f"❌ Load failed: {str(e)[:50]}")
-            st.sidebar.warning("⚠️ Using untrained model")
+            st.sidebar.error(f"❌ Model could not load: {str(e)[:50]}")
+            st.sidebar.warning("The live camera can still run, but its output is not reliable deblurring until the model is repaired.")
     else:
-        st.sidebar.warning("⚠️ No trained weights found")
-        st.sidebar.info("🎓 Using ImageNet-pretrained encoder only")
+        st.sidebar.warning("No compatible trained deblurring model is linked yet.")
+        st.sidebar.info("The live camera and video workflow will run, but output uses a fallback encoder rather than your trained deblurring model.")
     model.eval()
     return model
 
@@ -335,6 +335,20 @@ def main():
     # WEBCAM
     # ══════════════════════════════════════════════════════════════════════════
     if input_source == "Use webcam":
+        st.markdown(f"""
+        <div style="background:{BG_CARD};border:1px solid {BORDER};border-radius:14px;
+                    padding:22px;margin:10px 0 20px;max-width:760px;">
+            <div style="color:{TEXT_PRIMARY};font-size:1.05rem;font-weight:700;margin-bottom:6px;">Use your webcam for live enhancement</div>
+            <div style="color:{TEXT_MUTED};font-size:0.9rem;line-height:1.5;">
+                Click Start Live Camera, allow browser camera access, and RailVisionX will show each input frame beside its enhanced result.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("▶ Start Live Camera", type="primary", width="content"):
+            st.session_state.webcam_running = True
+            st.session_state.capture_start_time = time.time()
+            st.rerun()
+
         st.sidebar.markdown(f"<h4 style='color:{ACCENT_CYAN};'>⏱ Capture Duration</h4>",
                             unsafe_allow_html=True)
         use_duration     = st.sidebar.checkbox("Auto-stop after duration", value=False)
@@ -410,16 +424,16 @@ def main():
                     with img_col:
                         r1, r2 = st.columns(2)
                         r1.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-                                 caption="Blurred Input", use_container_width=True)
+                                 caption="Blurred Input", width="stretch")
                         r2.image(deblurred, caption="Deblurred Output",
-                                 use_container_width=True)
+                                 width="stretch")
 
                     # Right column: gauge + improvement bar + metric table
                     with metric_col:
                         gauge_ph.plotly_chart(build_fps_gauge(fps),
-                                              use_container_width=True, key=f"gauge_{frame_count}")
+                                              width="stretch", key=f"gauge_{frame_count}")
                         impr_ph.plotly_chart(build_improvement_bar(metrics),
-                                             use_container_width=True, key=f"impr_{frame_count}")
+                                             width="stretch", key=f"impr_{frame_count}")
                         metric_ph.markdown(
                             metric_row_html(metrics, fps, frame_count, inf_t * 1000),
                             unsafe_allow_html=True,
@@ -429,7 +443,7 @@ def main():
                     if frame_count % 5 == 0 and len(frames_data) > 1:
                         chart_ph.plotly_chart(
                             build_live_chart(frames_data[-50:]),
-                            use_container_width=True, key=f"chart_{frame_count}",
+                            width="stretch", key=f"chart_{frame_count}",
                         )
 
                     if snapshot_btn:
@@ -499,11 +513,11 @@ def main():
                         with c_left:
                             st.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
                                      caption=f"Blurred · Frame {frame_count}/{total}",
-                                     use_container_width=True)
+                                     width="stretch")
                         with c_right:
                             st.image(deblurred,
                                      caption=f"Deblurred · Frame {frame_count}/{total}",
-                                     use_container_width=True)
+                                     width="stretch")
                         prog.progress(frame_count / max(total, 1),
                                       text=f"Frame {frame_count}/{total} · {fps:.1f} fps")
 
@@ -521,7 +535,7 @@ def main():
                 # Post-processing charts
                 section_header("📊 Performance Analysis", "Full-video metrics breakdown")
                 st.plotly_chart(build_live_chart(frames_data),
-                                use_container_width=True)
+                                width="stretch")
                 _csv_export(frames_data)
 
     # ── Saved snapshots ───────────────────────────────────────────────────────
@@ -567,10 +581,10 @@ def _show_snapshots():
     for idx, snap in enumerate(st.session_state.saved_frames):
         with st.expander(f"Snapshot {idx+1} · Frame {snap['frame_num']}", expanded=False):
             c1, c2 = st.columns(2)
-            c1.image(snap["blurred"],   caption="Blurred",   use_container_width=True)
-            c2.image(snap["deblurred"], caption="Deblurred", use_container_width=True)
+            c1.image(snap["blurred"], caption="Blurred", width="stretch")
+            c2.image(snap["deblurred"], caption="Deblurred", width="stretch")
             m = snap["metrics"]
-            st.plotly_chart(build_improvement_bar(m), use_container_width=True,
+            st.plotly_chart(build_improvement_bar(m), width="stretch",
                             key=f"snap_bar_{idx}")
             st.markdown(
                 metric_row_html(m, 0, snap["frame_num"], 0),

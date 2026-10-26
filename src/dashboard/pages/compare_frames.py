@@ -213,7 +213,7 @@ def main():
         elif viz_mode == "Plotly Heatmap":
             section_header("🌡 Interactive Plotly Heatmap",
                            "Zoom, pan, and hover to inspect pixel-level differences")
-            st.plotly_chart(_diff_plotly(img1, img2), use_container_width=True)
+            st.plotly_chart(_diff_plotly(img1, img2), width="stretch")
 
             s1, s2, s3 = st.columns(3)
             s1.markdown(_stat_card("Mean Δ",  f"{np.mean(diff_f):.4f}"), unsafe_allow_html=True)
@@ -228,9 +228,9 @@ def main():
             )
             diff_heatmap = image_diff_heatmap(img1, img2, colormap)
             r1, r2, r3 = st.columns(3)
-            r1.image(img1, caption="Blurred",  use_container_width=True)
-            r2.image(img2, caption="Deblurred", use_container_width=True)
-            r3.image(diff_heatmap, caption=f"Heatmap ({colormap})", use_container_width=True)
+            r1.image(img1, caption="Blurred", width="stretch")
+            r2.image(img2, caption="Deblurred", width="stretch")
+            r3.image(diff_heatmap, caption=f"Heatmap ({colormap})", width="stretch")
 
         elif viz_mode == "Metrics Overlay":
             section_header("📋 Metrics Overlay",
@@ -241,8 +241,8 @@ def main():
             ov1 = image_metrics_overlay(img1, {"Blur": lap1, "Grad": grad1}, position)
             ov2 = image_metrics_overlay(img2, {"Blur": lap2, "Grad": grad2, "Imp": f"{imp:+.1f}%"}, position)
             c_l, c_r = st.columns(2)
-            c_l.image(ov1, caption="Blurred + Metrics",   use_container_width=True)
-            c_r.image(ov2, caption="Deblurred + Metrics", use_container_width=True)
+            c_l.image(ov1, caption="Blurred + Metrics", width="stretch")
+            c_r.image(ov2, caption="Deblurred + Metrics", width="stretch")
 
         else:  # All Views
             section_header("📑 All Visualisations")
@@ -254,7 +254,7 @@ def main():
             st.markdown("<hr>", unsafe_allow_html=True)
             st.markdown(f"<h4 style='color:{TEXT_MUTED};'>② Plotly Difference Heatmap</h4>",
                         unsafe_allow_html=True)
-            st.plotly_chart(_diff_plotly(img1, img2), use_container_width=True)
+            st.plotly_chart(_diff_plotly(img1, img2), width="stretch")
 
             st.markdown("<hr>", unsafe_allow_html=True)
             st.markdown(f"<h4 style='color:{TEXT_MUTED};'>③ Side-by-Side</h4>",

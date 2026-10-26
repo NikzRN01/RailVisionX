@@ -262,7 +262,7 @@ def main():
         ic, sc = st.columns([3, 2])
         with ic:
             st.image(img, caption=f"Rank #{selected} · {images[fi][1]}",
-                     use_container_width=True)
+                     width="stretch")
         with sc:
             section_header("Frame Details")
             img_norm = img.astype(np.float32) / 255.0
@@ -289,7 +289,7 @@ def main():
         # Ranking table
         st.markdown(f"<h4 style='color:{TEXT_MUTED};margin-top:24px;'>Full Rankings Table</h4>",
                     unsafe_allow_html=True)
-        st.dataframe(results_df, use_container_width=True, hide_index=True)
+        st.dataframe(results_df, width="stretch", hide_index=True)
 
         if st.button("📥 Export CSV"):
             csv = results_df.to_csv(index=False)
@@ -301,11 +301,11 @@ def main():
         section_header("📈 Score Distribution", "Top-K frames highlighted in cyan")
 
         st.plotly_chart(_dist_chart(scores, top_set, k, metric),
-                        use_container_width=True)
+                        width="stretch")
 
         st.markdown(f"<h4 style='color:{TEXT_MUTED};margin-top:8px;'>Score Timeline</h4>",
                     unsafe_allow_html=True)
-        st.plotly_chart(_score_timeline(scores, top_set), use_container_width=True)
+        st.plotly_chart(_score_timeline(scores, top_set), width="stretch")
 
         # Stats comparison
         top_scores  = [scores[i] for i in top_idx]
