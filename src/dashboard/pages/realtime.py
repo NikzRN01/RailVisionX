@@ -5,6 +5,7 @@ import cv2
 import torch
 import numpy as np
 import time
+import tempfile
 from pathlib import Path
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
@@ -123,18 +124,27 @@ def deblur_frame(model, frame: np.ndarray, device: str):
     return deblurred, time.time() - t0
 
 
-def calculate_frame_metrics(blurred_frame: np.ndarray, deblurred_frame: np.ndarray) -> dict:
+def calculate_frame_metrics(blurred_frame: np.ndarray, deblurred_frame: np.ndarray,
+                            blurred_is_bgr: bool = True) -> dict:
     """Calculate comprehensive quality metrics comparing blurred and deblurred frames.
 
     Args:
-        blurred_frame: Input blurred frame (RGB or BGR)
-        deblurred_frame: Deblurred output frame (RGB)
+        blurred_frame: Input blurred frame (RGB or BGR).
+        deblurred_frame: Deblurred output frame (always RGB from postprocess_frame).
+        blurred_is_bgr: Set True when blurred_frame comes directly from cv2.VideoCapture
+                        (BGR byte order). Set False when it is already RGB (e.g. a saved
+                        snapshot retrieved from session_state).
 
     Returns:
         Dictionary with all metrics and improvements, keyed by:
         'blurred', 'deblurred', 'comparison', 'improvements'
     """
-    blurred_rgb = cv2.cvtColor(blurred_frame, cv2.COLOR_BGR2RGB) if blurred_frame.dtype == np.uint8 else blurred_frame
+    # Convert to RGB only when the caller confirms the frame is BGR.
+    if blurred_is_bgr and blurred_frame.ndim == 3 and blurred_frame.shape[2] == 3:
+        blurred_rgb = cv2.cvtColor(blurred_frame, cv2.COLOR_BGR2RGB)
+    else:
+        blurred_rgb = blurred_frame
+
     if blurred_rgb.shape != deblurred_frame.shape:
         blurred_rgb = cv2.resize(blurred_rgb, (deblurred_frame.shape[1], deblurred_frame.shape[0]))
 
@@ -193,6 +203,13 @@ def build_fps_gauge(fps: float) -> go.Figure:
     return fig
 
 
+def _hex_to_rgba(hex_color: str, alpha: float = 0.08) -> str:
+    """Convert a hex color string like '#00d4ff' to 'rgba(0,212,255,0.08)'."""
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
 def build_live_chart(frames_data: list) -> go.Figure:
     if not frames_data:
         return go.Figure()
@@ -213,7 +230,7 @@ def build_live_chart(frames_data: list) -> go.Figure:
             x=x, y=y, name=name, mode="lines",
             line=dict(color=color, width=2, shape="spline"),
             fill="tozeroy" if fill else "none",
-            fillcolor=color.replace(")", ",0.08)").replace("rgb", "rgba") if fill else None,
+            fillcolor=_hex_to_rgba(color, 0.08) if fill else None,
         ), row=row, col=col)
 
     line(xs, psnrs,  "PSNR",          ACCENT_CYAN,  1, 1, fill=True)
@@ -265,16 +282,12 @@ def metric_row_html(metrics: dict, fps: float, frame_num: int, inf_ms: float) ->
     c = metrics["comparison"]
     imp = metrics["improvements"]
 
-    def pill(val, good_condition: bool):
-        color = SUCCESS if good_condition else DANGER
-        return f"<span style='color:{color};font-weight:700;'>{val}</span>"
-
     rows = [
-        ("PSNR",     f"{c['psnr']:.2f} dB",            "higher ↑ is better"),
-        ("SSIM",     f"{c['ssim']:.4f}",                "0–1, higher is better"),
-        ("MAE",      f"{c['mae']:.4f}",                 "lower ↓ is better"),
-        ("Px Acc",   f"{c['pixel_accuracy']:.1f}%",     "within 10% threshold"),
-        ("Sharpness ↑", f"{imp['sharpness']:+.1f}%",   "deblurred vs blurred"),
+        ("PSNR",        f"{c['psnr']:.2f} dB",           "higher ↑ is better"),
+        ("SSIM",        f"{c['ssim']:.4f}",               "0–1, higher is better"),
+        ("MAE",         f"{c['mae']:.4f}",                "lower ↓ is better"),
+        ("Px Acc",      f"{c['pixel_accuracy']:.1f}%",    "within 10% threshold"),
+        ("Sharpness ↑", f"{imp['sharpness']:+.1f}%",      "deblurred vs blurred"),
     ]
     trs = "".join(f"""
     <tr>
@@ -479,54 +492,67 @@ def main():
         uploaded = st.file_uploader("Video file", type=["mp4", "avi", "mov", "mkv"])
 
         if uploaded:
-            tmp = Path("temp_upload.mp4")
-            tmp.write_bytes(uploaded.read())
-            cap = cv2.VideoCapture(str(tmp))
-            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            st.info(f"🎞 Loaded **{total}** frames")
-
             if st.button("▶ Process Video"):
-                prog      = st.progress(0, text="Processing…")
-                img_left  = st.empty()
-                img_right = st.empty()
-                c_left, c_right = st.columns(2)
+                suffix = Path(uploaded.name).suffix.lower() or ".mp4"
+                tmp = None
+                cap = None
+                try:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+                        tmp_file.write(uploaded.getvalue())
+                        tmp = Path(tmp_file.name)
 
-                frame_count = 0
-                fps_vals    = []
+                    cap = cv2.VideoCapture(str(tmp))
+                    if not cap.isOpened():
+                        st.error("❌ The uploaded video could not be opened. Try a supported MP4, AVI, MOV, or MKV file.")
+                        return
 
-                while True:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
+                    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    st.info(f"🎞 Loaded **{total}** frames")
+                    prog = st.progress(0, text="Processing…")
+                    c_left, c_right = st.columns(2)
+                    frame_count = 0
+                    fps_vals = []
 
-                    deblurred, inf_t = deblur_frame(model, frame, device)
-                    fps = 1 / inf_t if inf_t > 0 else 0
-                    fps_vals.append(fps)
-                    metrics = calculate_frame_metrics(frame, deblurred)
-                    frames_data.append({
-                        "frame_num":      frame_count,
-                        "inference_time": inf_t * 1000,
-                        "metrics":        metrics,
-                    })
+                    while True:
+                        ret, frame = cap.read()
+                        if not ret:
+                            break
 
-                    if frame_count % 10 == 0:
-                        with c_left:
-                            st.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-                                     caption=f"Blurred · Frame {frame_count}/{total}",
-                                     width="stretch")
-                        with c_right:
-                            st.image(deblurred,
-                                     caption=f"Deblurred · Frame {frame_count}/{total}",
-                                     width="stretch")
-                        prog.progress(frame_count / max(total, 1),
-                                      text=f"Frame {frame_count}/{total} · {fps:.1f} fps")
+                        deblurred, inf_t = deblur_frame(model, frame, device)
+                        fps = 1 / inf_t if inf_t > 0 else 0
+                        fps_vals.append(fps)
+                        metrics = calculate_frame_metrics(frame, deblurred, blurred_is_bgr=True)
+                        frames_data.append({
+                            "frame_num":      frame_count,
+                            "inference_time": inf_t * 1000,
+                            "metrics":        metrics,
+                        })
 
-                    frame_count += 1
+                        if frame_count % 10 == 0:
+                            with c_left:
+                                st.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                                         caption=f"Blurred · Frame {frame_count}/{total}",
+                                         width="stretch")
+                            with c_right:
+                                st.image(deblurred,
+                                         caption=f"Deblurred · Frame {frame_count}/{total}",
+                                         width="stretch")
+                            prog.progress(frame_count / max(total, 1),
+                                          text=f"Frame {frame_count}/{total} · {fps:.1f} fps")
 
-                cap.release()
-                tmp.unlink(missing_ok=True)
+                        frame_count += 1
 
-                avg_fps    = np.mean(fps_vals)
+                finally:
+                    if cap is not None:
+                        cap.release()
+                    if tmp is not None:
+                        tmp.unlink(missing_ok=True)
+
+                if not frames_data:
+                    st.error("❌ No video frames could be decoded from the uploaded file.")
+                    return
+
+                avg_fps    = float(np.mean(fps_vals))
                 total_time = sum(f["inference_time"] for f in frames_data) / 1000
                 st.success(
                     f"✅ Done · {frame_count} frames · Avg FPS: {avg_fps:.1f} · Time: {total_time:.1f}s"
