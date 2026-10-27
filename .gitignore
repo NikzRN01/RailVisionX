@@ -19,6 +19,7 @@ Thumbs.db
 outputs/
 realtime_data/raw/
 realtime_data/splits/
+tb.*.log
 
 # Model checkpoints (large binary artifacts)
 models/

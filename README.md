@@ -2,6 +2,8 @@
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)](https://pytorch.org/)
+[![Streamlit](https://img.shields.io/badge/Dashboard-Streamlit-FF4B4B.svg)](https://streamlit.io/)
+[![Plotly](https://img.shields.io/badge/Charts-Plotly-3F4F75.svg)](https://plotly.com/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 **RailVisionX** is an advanced computer vision pipeline for real-time and offline video processing, featuring state-of-the-art image deblurring using a MobileNetV2-based architecture with adversarial training (DeblurGAN-v2). The system leverages the lightweight MobileNetV2 backbone combined with Feature Pyramid Networks for efficient multi-scale feature extraction, optimized for edge deployment via TensorRT.
@@ -23,6 +25,7 @@
 - [Architecture](#architecture)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
+- [Dashboard](#dashboard)
 - [Project Structure](#project-structure)
 - [Training Pipeline](#training-pipeline)
 - [Evaluation & Metrics](#evaluation--metrics)
@@ -193,6 +196,67 @@ python apps/export_onnx.py \
     --checkpoint outputs/deblur_training/best_model.pth \
     --output models/deblur_generator.onnx
 ```
+
+---
+
+## Dashboard
+
+RailVisionX includes a dark-themed, interactive analytics dashboard built with **Streamlit + Plotly**.
+
+### Launch the Dashboard
+
+```bash
+streamlit run apps/dashboard.py
+```
+
+Open **http://localhost:8501** in your browser.
+
+### Dashboard Pages
+
+| Page | Description | Data Required |
+|------|-------------|---------------|
+| **🏠 Home** | Hero banner, system info, architecture overview | None |
+| **🎬 Real-time Deblurring** | Webcam or video upload → live Plotly charts (PSNR, SSIM, FPS gauge, sharpness) | Webcam or video file |
+| **🔍 Compare Frames** | Interactive drag-slider, Plotly diff heatmap, metrics overlay | Upload 2 images or use test dataset |
+| **🏆 Top-K Rankings** | Rank-badge gallery, score distribution chart, detail view | Upload images or use test dataset |
+
+### Why No Data Shows on First Run?
+
+The **Home page stats** (Blurred/Sharp frame counts) read from `data/split/test/`. These will show `0` until you:
+
+1. Add image pairs to `data/raw/blurred/` and `data/raw/sharp/`
+2. Run the split script: `python src/dataset/make_splits.py`
+3. Train the model: `python apps/train.py`
+
+**You do not need training data to use the dashboard** — all three pages accept uploaded images or video files directly via the sidebar.
+
+### Dashboard Dependencies
+
+The following packages are required for the dashboard (added to `requirements.txt`):
+
+```text
+streamlit     # Web framework
+plotly        # Interactive charts (gauges, heatmaps, line charts)
+scikit-image  # SSIM and PSNR metric computation
+```
+
+Install with:
+
+```bash
+pip install streamlit plotly scikit-image
+```
+
+### Design System
+
+The dashboard uses a custom dark glassmorphism theme defined in `src/dashboard/theme.py`:
+
+| Token | Value | Usage |
+|-------|-------|-------|
+| Background | `#0a0e1a` | Page & card backgrounds |
+| Accent Cyan | `#00d4ff` | Primary accent, metric values |
+| Accent Amber | `#f59e0b` | Warnings, highlights |
+| Success | `#10b981` | Positive improvements |
+| Danger | `#ef4444` | Degradation indicators |
 
 ---
 
